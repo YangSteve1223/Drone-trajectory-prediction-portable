@@ -3,8 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Adapter checkpoints (runtime generated)
-checkpoints/
+# Adapter checkpoints (runtime generated per-drone)
+checkpoints/adapters/
+checkpoints/*/
+!checkpoints/bidir_enhancer.pth
 
 # IDE
 .vscode/

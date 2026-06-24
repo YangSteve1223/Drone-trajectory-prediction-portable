@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 from typing import Optional
+from tqdm import tqdm
 from emam_model.bidirectional_mamba import BidirectionalMambaEncoder
 
 
@@ -123,82 +124,131 @@ class BidirectionalPredictor:
         ).to(self.device).eval()
 
         self._trained = False
+        self._original_encoder_forward = None
+        self._hook_active = False
+
+    def _inject_hook(self):
+        """Monkey-patch encoder to add bidirectional features as residual."""
+        if self._hook_active:
+            return
+        encoder = self.predictor.mixed.emam_se
+        self._original_encoder_forward = encoder.forward
+
+        enhancer = self.enhancer
+        def enhanced_forward(x):
+            base_encoded = self._original_encoder_forward(x)
+            bi = enhancer(x)
+            # Add bidirectional residual (bi is (B,T,D), same shape as base_encoded)
+            return base_encoded + bi
+
+        encoder.forward = enhanced_forward
+        self._hook_active = True
+
+    def _remove_hook(self):
+        """Restore original encoder forward."""
+        if not self._hook_active or self._original_encoder_forward is None:
+            return
+        self.predictor.mixed.emam_se.forward = self._original_encoder_forward
+        self._hook_active = False
 
     @torch.no_grad()
     def predict(self, hist: torch.Tensor, **kwargs) -> dict:
-        """
-        Enhanced prediction with bidirectional context.
-
-        Falls back to standard prediction if enhancer is untrained.
-        """
+        """Enhanced prediction with bidirectional context."""
         hist = hist.to(self.device)
-
         if self._trained:
-            # Apply bidirectional enhancement
-            bi_features = self.enhancer(hist)
-            # The current architecture doesn't directly inject bi_features
-            # into the model's forward pass. For now, we use the standard
-            # prediction. Full integration requires modifying the model or
-            # using the bi_features as an auxiliary input.
-            #
-            # Once trained, the enhancer can be merged into the model's
-            # encoder output via feature addition:
-            #   enhanced_encoded = encoded + bi_features
-
-        # Standard prediction
-        return self.predictor.predict(hist, **kwargs)
+            self._inject_hook()
+        result = self.predictor.predict(hist, **kwargs)
+        return result
 
     def predict_with_adaptation(self, hist, **kwargs) -> dict:
         """Enhanced prediction with LoRA adaptation."""
+        if self._trained:
+            self._inject_hook()
         return self.predictor.predict_with_adaptation(hist, **kwargs)
 
-    def train_enhancer(self, train_loader, epochs: int = 5, lr: float = 1e-4):
+    def train_enhancer(self, train_loader, epochs: int = 5, lr: float = 1e-4,
+                       amp: bool = True):
         """
-        Train the bidirectional enhancer on your dataset.
+        Train the bidirectional enhancer.
 
-        This fine-tunes only the bidirectional branch (~500K params).
-        The base model remains frozen.
+        Fine-tunes only the bidirectional branch (~122K params).
+        Base model weights remain frozen. Bi-directional features are
+        injected as a residual into the encoder output.
 
         Args:
             train_loader: DataLoader yielding (history, future_gt, intent).
             epochs: Number of training epochs.
             lr: Learning rate.
+            amp: Use automatic mixed precision.
         """
         self.enhancer.enable_training()
         self.enhancer.train()
-        optimizer = torch.optim.AdamW(self.enhancer.parameters(), lr=lr)
-        self.predictor.mixed.train()  # Need encoder gradients
+
+        # Freeze base model, only train enhancer
+        for param in self.predictor.mixed.parameters():
+            param.requires_grad_(False)
+
+        # Inject hook so bi_features flow through the model
+        self._inject_hook()
+
+        optimizer = torch.optim.AdamW(self.enhancer.parameters(), lr=lr,
+                                       weight_decay=1e-5)
+        scaler = torch.amp.GradScaler('cuda') if (amp and self.device.type == 'cuda') else None
+        use_amp = scaler is not None
+
+        best_loss = float('inf')
+        save_path = Path('checkpoints/bidir_enhancer.pth')
+        save_path.parent.mkdir(parents=True, exist_ok=True)
 
         for epoch in range(epochs):
             total_loss = 0
-            for batch_idx, (hist, pred, intent) in enumerate(train_loader):
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs}')
+            for hist, pred, intent in pbar:
                 hist = hist.to(self.device)
                 pred = pred.to(self.device)
 
                 optimizer.zero_grad()
 
-                # Forward through base model (with grad) + enhancer
-                bi_features = self.enhancer(hist)
-
-                # Get base model output
-                out = self.predictor.mixed(hist, force_predict=True)
-                predictions = out['predictions']
-                targets = pred[..., :3] - hist[:, -1:, :3]
-
-                # MSE loss
-                loss = nn.functional.mse_loss(predictions, targets)
-                loss.backward()
-                optimizer.step()
+                if use_amp:
+                    with torch.amp.autocast('cuda'):
+                        out = self.predictor.mixed(hist, force_predict=True)
+                        targets = pred[..., :3] - hist[:, -1:, :3]
+                        loss = nn.functional.mse_loss(out['predictions'], targets)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.enhancer.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    out = self.predictor.mixed(hist, force_predict=True)
+                    targets = pred[..., :3] - hist[:, -1:, :3]
+                    loss = nn.functional.mse_loss(out['predictions'], targets)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.enhancer.parameters(), 1.0)
+                    optimizer.step()
 
                 total_loss += loss.item()
+                pbar.set_postfix(loss=f'{loss.item():.4f}')
 
-            avg_loss = total_loss / max(len(train_loader), 1)
-            print(f"  Epoch {epoch + 1}/{epochs}: loss={avg_loss:.4f}")
+            avg = total_loss / max(len(train_loader), 1)
+            print(f'  Epoch {epoch+1}: avg_loss={avg:.4f}')
 
+            if avg < best_loss:
+                best_loss = avg
+                torch.save({
+                    'model_state_dict': self.enhancer.state_dict(),
+                    'loss': avg, 'epoch': epoch,
+                }, save_path)
+                print(f'  -> Best saved: {save_path}')
+
+        # Cleanup
         self.enhancer.eval()
-        self.predictor.mixed.eval()
+        self._remove_hook()
+        for param in self.predictor.mixed.parameters():
+            param.requires_grad_(True)
         self._trained = True
-        print("Enhancer training complete.")
+        print(f'Training complete. Best loss: {best_loss:.4f}')
+        print(f'Weights: {save_path}')
 
     @property
     def trained(self) -> bool:
