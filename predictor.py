@@ -16,13 +16,32 @@ Online adaptation:
 """
 
 import torch
+import warnings
 from pathlib import Path
 from typing import Optional
 from emam_model import TrajectoryPredictor
 from utils.metrics import full_evaluation
 from utils.fast_data_loader import FastWindowDataset
 
-_DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Device selection: CUDA > MPS (Apple Silicon) > CPU
+def _detect_device(verbose=True):
+    if torch.cuda.is_available():
+        dev = torch.device('cuda')
+        if verbose:
+            name = torch.cuda.get_device_name(0)
+            mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"[Device] CUDA: {name} ({mem:.1f} GB)")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        dev = torch.device('mps')
+        if verbose:
+            print("[Device] MPS (Apple Silicon)")
+    else:
+        dev = torch.device('cpu')
+        if verbose:
+            print("[Device] CPU")
+    return dev
+
+_DEVICE = _detect_device()
 _WEIGHT_DIR = Path(__file__).parent / 'weights'
 
 # 速度阈值 (真实物理 m/s)
@@ -129,6 +148,16 @@ class DronePredictor:
             intent_logits : (B, 6)      意图分类logits
             speed         : (B,)        检测到的速度 (m/s)
         """
+        # Input validation
+        if hist.dim() != 3 or hist.shape[1] != 20 or hist.shape[2] != 6:
+            raise ValueError(
+                f"Expected shape (B, 20, 6), got {hist.shape}. "
+                f"Input: [pos_x,pos_y,pos_z, vx,vy,vz] for 20 frames."
+            )
+        if torch.isnan(hist).any():
+            warnings.warn("Input contains NaN values, replacing with zeros.")
+            hist = torch.nan_to_num(hist, nan=0.0)
+
         hist = hist.to(self.device)
         speed = self.compute_speed(hist)
         w_low, w_mixed, w_high = self.blend_weights(speed)
@@ -226,6 +255,15 @@ class DronePredictor:
             adapted : bool — whether LoRA was applied
             updated : bool — whether an online update was triggered
         """
+        # Input validation
+        if hist.dim() != 3 or hist.shape[1] != 20 or hist.shape[2] != 6:
+            raise ValueError(
+                f"Expected shape (B, 20, 6), got {hist.shape}."
+            )
+        if torch.isnan(hist).any():
+            warnings.warn("Input contains NaN values, replacing with zeros.")
+            hist = torch.nan_to_num(hist, nan=0.0)
+
         hist = hist.to(self.device)
 
         # Inference under no_grad (base models + speed + weights)
