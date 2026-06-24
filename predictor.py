@@ -200,14 +200,12 @@ class DronePredictor:
 
     def predict_normalized(self, hist, return_norm_params=False):
         """
-        Predict with per-window dynamic normalization.
+        Predict with per-window dynamic normalization (for FUTURE retrained models).
 
-        NOTE: Current weights were trained with fixed normalization (_scale_pos=100).
-        Dynamic norm may degrade prediction quality (esp. on NPZDATA high-speed).
-        For production use, train a new model with dynamic norm enabled, or use
-        predict() which matches the training distribution.
+        Uses DynamicNormalizer to adapt scale, bypassing model's internal norm.
+        Only works well with models trained with dynamic normalization.
 
-        This method is PROVIDED FOR FUTURE USE with dynamically-trained weights.
+        For existing weights, use predict_adaptive() instead.
         """
         from dynamic_norm import DynamicNormalizer, NormConfig
 
@@ -216,8 +214,6 @@ class DronePredictor:
         ))
         hist_norm, norm_params = norm.normalize(hist)
 
-        # Run model with internal normalization bypassed
-        # (each model's forward supports normalize_input=False)
         for model in [self.low, self.mixed, self.high]:
             model._norm_input = False
 
@@ -230,6 +226,68 @@ class DronePredictor:
         result['speed'] = self.compute_speed(hist)
         if return_norm_params:
             result['norm_params'] = norm_params
+        return result
+
+    def predict_adaptive(self, hist, return_scale=False):
+        """
+        Scale-adaptive prediction — works with EXISTING trained weights.
+
+        Instead of bypassing the model's internal /100 normalization,
+        this method scales the input TO the model's training distribution.
+        Small-domain data (UAV-Flow) gets scaled UP, large-domain (NPZDATA)
+        stays near the training range.
+
+        Formula:
+          scale_factor = model_training_scale / current_window_scale
+          input_scaled = input * scale_factor
+          → model processes in its comfortable range
+          → output / scale_factor to get real-world meters
+
+        This preserves prediction quality for existing weights while
+        providing adaptive scaling for visualization.
+        """
+        from dynamic_norm import DynamicNormalizer, NormConfig
+
+        # Compute current window scale (same as predict_normalized)
+        norm = DynamicNormalizer(NormConfig(
+            method="velocity", center_on_first=True, scale_smoothing=0.7,
+        ))
+        _, norm_params = norm.normalize(hist)
+        current_scale = norm_params['scale_pos']
+
+        # Model was trained with _scale_pos=100 — that's its comfortable range
+        MODEL_SCALE = 100.0
+
+        # Scale factor: bring input to model's training distribution
+        # scale_factor > 1: small-domain data gets amplified (UAV-Flow)
+        # scale_factor ≈ 1: large-domain data unchanged (NPZDATA)
+        if isinstance(current_scale, torch.Tensor):
+            scale_factor = torch.clamp(MODEL_SCALE / current_scale, min=0.1, max=50.0)
+            sf_3d = scale_factor.view(-1, 1, 1)
+        else:
+            scale_factor = max(0.1, min(50.0, MODEL_SCALE / current_scale))
+            sf_3d = scale_factor
+
+        # Scale input to model's comfort zone
+        hist_scaled = hist.clone()
+        hist_scaled[:, :, :3] = hist[:, :, :3] * sf_3d
+        hist_scaled[:, :, 3:6] = hist[:, :, 3:6] * sf_3d
+
+        # Standard prediction (model's internal /100 works correctly now)
+        result = self.predict(hist_scaled)
+
+        # Undo scaling on output
+        if isinstance(scale_factor, torch.Tensor):
+            result['predictions'] = result['predictions'] / sf_3d
+        else:
+            result['predictions'] = result['predictions'] / sf_3d
+
+        # Speed is computed from original (unscaled) input
+        result['speed'] = self.compute_speed(hist)
+
+        if return_scale:
+            result['adaptive_scale'] = scale_factor
+            result['current_scale'] = current_scale
         return result
 
     # ---- Online Continual Learning (LoRA) ----
