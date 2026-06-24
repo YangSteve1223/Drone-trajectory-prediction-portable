@@ -71,26 +71,51 @@ print(status)  # {num_updates, replay_size, escalated, ...}
 - 📈 CUSUM 检测预测退化 → 自动升级学习率
 - 💾 定期自动持久化到 `checkpoints/adapters/`
 
+## 流式实时推理
+
+逐帧输入，滚动窗口，每帧输出预测——适合机载实时部署。
+
+```python
+from streaming import StreamingPredictor
+
+sp = StreamingPredictor(predictor)
+
+for frame in sensor_stream:           # frame: (6,) [pos, vel]
+    result = sp.update(frame)         # None until buffer full (20 frames)
+    if result is not None:
+        future_traj = result['predictions']  # (1, 20, 3)
+sp.reset()  # 新起降周期
+```
+
+## 双向 Mamba 增强 (实验性)
+
+双向 SSM 编码器，同时扫描前向和后向时间依赖。
+
+```python
+from bidirectional import BidirectionalPredictor
+bp = BidirectionalPredictor(predictor)
+out = bp.predict(history)
+# 训练: bp.train_enhancer(train_loader, epochs=5)
+```
+
 ## 目录结构
 
 ```
-├── predictor.py          # DronePredictor (推理 + 在线学习入口)
-├── lora.py               # LoRALinear, LoRAAdapter, merge/unmerge
+├── predictor.py          # DronePredictor (推理 + LoRA在线学习)
+├── streaming.py          # StreamingPredictor (流式逐帧推理)
+├── bidirectional.py      # BidirectionalPredictor (双向SSM)
+├── lora.py               # LoRALinear, LoRAAdapter
 ├── adapter_manager.py    # DroneAdapterManager, ReplayBuffer, CUSUM
-├── online_learner.py     # OnlineLearner, 累积/更新/持久化
-├── emam_model/           # EMAM 模型架构 (6 files)
+├── online_learner.py     # OnlineLearner
+├── emam_model/           # EMAM 模型架构
 │   ├── model.py          # TrajectoryPredictor
-│   ├── emam_se.py        # Enhanced Mamba SE (SSM)
-│   ├── ia_dtp.py         # Intent-Aware Dynamic Temporal Pyramid
-│   ├── ua_pgd.py         # Uncertainty-Aware Physics-Guided Decoder
-│   └── trigger.py        # 事件触发器 (Simple/Funnel/EventDriven)
+│   ├── emam_se.py        # Enhanced Mamba SE
+│   ├── bidirectional_mamba.py  # 双向选择性SSM
+│   ├── ia_dtp.py         # Intent-Aware DTP
+│   ├── ua_pgd.py         # Uncertainty-Aware PGD
+│   └── trigger.py        # 事件触发器
 ├── utils/
-│   ├── fast_data_loader.py
-│   └── metrics.py
 ├── weights/              # 预训练权重 (~48MB)
-│   ├── low_speed_6class.pth
-│   ├── mixed_6class.pth
-│   └── high_speed_4class.pth
 └── README.md
 ```
 
