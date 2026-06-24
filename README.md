@@ -1,27 +1,74 @@
 # Drone Trajectory Prediction — Portable
 
-可移植的无人机轨迹预测推理包。三模型速度自适应软切换 + LoRA在线持续学习，开箱即用。
+可移植的无人机轨迹预测完整工具包。推理 + 在线学习 + 训练，开箱即用。
+
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 
 ## 快速开始
 
 ```bash
-pip install torch numpy
+pip install torch numpy tqdm pyyaml
 ```
 
 ```python
 from predictor import DronePredictor
 
-# 加载模型 (首次自动加载三模型权重 ~48MB)
 predictor = DronePredictor()
 
-# 输入: (B, 20, 6) — 历史20帧, 每帧 [x, y, z, vx, vy, vz] (米, 米/秒)
+# 输入: (B, 20, 6) 历史20帧 [pos_x,pos_y,pos_z, vx,vy,vz] (米, 米/秒)
 history = torch.randn(1, 20, 6)
-
-# 预测
 result = predictor.predict(history)
-result['predictions']    # (1, 20, 3) 未来3D位移 (米)
-result['intent_logits']  # (1, 6)    意图分类logits
-result['speed']          # (1,)      检测速度 (m/s)
+
+result['predictions']    # (1, 20, 3) 未来3D位移
+result['intent_logits']  # (1, 6)    意图分类
+result['speed']          # (1,)      检测速度
+```
+
+## 核心能力
+
+| 功能 | 说明 |
+|------|------|
+| 🎯 **三模型软切换** | 基于速度自适应选择低速/混合/高速模型，路由准确率 100% |
+| 🧬 **LoRA 在线学习** | 每台无人机独立微调 (~11K参数)，在线适应个体飞行特征 |
+| 🔄 **流式实时推理** | 逐帧输入，滚动窗口，适合机载边缘部署 |
+| 🔀 **双向 Mamba 增强** | 前向+后向 SSM 编码，改善长程预测和机动过渡 |
+| 📦 **完整训练管线** | 提供训练脚本和示例数据集，可从零训练全部模型 |
+
+## 目录结构
+
+```
+├── predictor.py              # DronePredictor 推理入口
+├── streaming.py              # StreamingPredictor 流式推理
+├── bidirectional.py          # BidirectionalPredictor 双向SSM
+├── lora.py                   # LoRA 低秩适配
+├── adapter_manager.py        # 多无人机适配器管理
+├── online_learner.py         # 在线累积学习引擎
+├── emam_model/               # EMAM 模型架构
+│   ├── model.py              # TrajectoryPredictor
+│   ├── emam_se.py            # Enhanced Mamba SE
+│   ├── bidirectional_mamba.py
+│   ├── ia_dtp.py             # Intent-Aware DTP
+│   ├── ua_pgd.py             # Uncertainty-Aware PGD
+│   └── trigger.py
+├── utils/                    # 数据加载 + 评估指标
+├── weights/                  # 预训练权重 (48MB)
+│   ├── low_speed_6class.pth
+│   ├── mixed_6class.pth
+│   └── high_speed_4class.pth
+├── checkpoints/              # 训练产出
+│   └── bidir_enhancer.pth    # 双向增强器权重
+├── train/                    # 训练管线
+│   ├── train.py              # 主训练脚本
+│   ├── train_bidir.py        # 双向增强器训练
+│   ├── preprocess_uavflow.py # 数据预处理
+│   ├── extract_uavflow.py    # 数据下载提取
+│   ├── *.ps1                 # 训练启动脚本
+│   ├── dataset/              # 示例数据集 (295MB)
+│   │   ├── uavflow_low/      #   UAV-Flow 低速 (59 chunks)
+│   │   └── npzdata_high/     #   NPZDATA 高速 (14 chunks)
+│   └── README.md             # 训练文档
+└── README.md
 ```
 
 ## 三模型速度自适应软切换
@@ -45,102 +92,66 @@ result['speed']          # (1,)      检测速度 (m/s)
 
 ## LoRA 在线持续学习
 
-每个无人机独立 LoRA 微调 (~11K参数/drone, ~50KB磁盘)，少量观测即可适配个体飞行特征。
-
 ```python
-predictor.enable_adaptation()   # 开启在线学习
+predictor.enable_adaptation()
 
-# 流式推理 + 自适应微调
-for timestep, (hist, ground_truth) in enumerate(data_stream):
+for t, (hist, gt) in enumerate(data_stream):
     out = predictor.predict_with_adaptation(
         hist, drone_id='drone_001',
-        ground_truth=ground_truth,
-        timestep=timestep,
+        ground_truth=gt, timestep=t,
     )
-    # 自动: 累积5帧 → 梯度更新 → 定期持久化
-
-# 查看学习状态
-status = predictor.get_drone_status('drone_001')
-print(status)  # {num_updates, replay_size, escalated, ...}
+    # 自动累积5帧 → 梯度更新 → 定期持久化
 ```
 
-**特性:**
-- 🎯 LoRA rank-4, ~11K 可训练参数, 仅作用于 Mixed 模型
-- 📦 每 drone ~50KB 磁盘, 100 drones < 5MB
-- 🛡️ Replay Buffer 防灾难性遗忘
-- 📈 CUSUM 检测预测退化 → 自动升级学习率
-- 💾 定期自动持久化到 `checkpoints/adapters/`
+| 特性 | 参数 |
+|------|------|
+| 可训练参数 | ~11K / drone |
+| 磁盘占用 | ~50KB / drone |
+| LoRA rank | r=4 |
+| 防遗忘 | Replay Buffer (20条) |
+| 退化检测 | CUSUM + 自动升级 |
 
 ## 流式实时推理
-
-逐帧输入，滚动窗口，每帧输出预测——适合机载实时部署。
 
 ```python
 from streaming import StreamingPredictor
 
 sp = StreamingPredictor(predictor)
-
-for frame in sensor_stream:           # frame: (6,) [pos, vel]
-    result = sp.update(frame)         # None until buffer full (20 frames)
-    if result is not None:
-        future_traj = result['predictions']  # (1, 20, 3)
-sp.reset()  # 新起降周期
+for frame in sensor_stream:
+    result = sp.update(frame)      # None until 20-frame buffer full
+    if result:
+        future = result['predictions']  # (1, 20, 3)
 ```
 
-## 双向 Mamba 增强 (实验性)
+## 训练自己的模型
 
-双向 SSM 编码器，同时扫描前向和后向时间依赖。
+```bash
+# 训练低速模型
+cd train
+python train.py --data_root dataset/uavflow_low --num_intent_classes 6 \
+    --d_model 128 --batch_size 128 --epochs 30 --lr 1e-4 \
+    --trigger_mode simple --exp_name my_model
 
-```python
-from bidirectional import BidirectionalPredictor
-bp = BidirectionalPredictor(predictor)
-out = bp.predict(history)
-# 训练: bp.train_enhancer(train_loader, epochs=5)
+# 训练双向增强器
+python train_bidir.py --data_dir dataset/uavflow_low --epochs 5
 ```
 
-## 目录结构
-
-```
-├── predictor.py          # DronePredictor (推理 + LoRA在线学习)
-├── streaming.py          # StreamingPredictor (流式逐帧推理)
-├── bidirectional.py      # BidirectionalPredictor (双向SSM)
-├── lora.py               # LoRALinear, LoRAAdapter
-├── adapter_manager.py    # DroneAdapterManager, ReplayBuffer, CUSUM
-├── online_learner.py     # OnlineLearner
-├── emam_model/           # EMAM 模型架构
-│   ├── model.py          # TrajectoryPredictor
-│   ├── emam_se.py        # Enhanced Mamba SE
-│   ├── bidirectional_mamba.py  # 双向选择性SSM
-│   ├── ia_dtp.py         # Intent-Aware DTP
-│   ├── ua_pgd.py         # Uncertainty-Aware PGD
-│   └── trigger.py        # 事件触发器
-├── utils/
-├── weights/              # 预训练权重 (~48MB)
-└── README.md
-```
-
-## 依赖
-
-| 包 | 版本 | 用途 |
-|---|------|------|
-| Python | >= 3.8 | |
-| PyTorch | >= 2.0 | 推理 + 训练 |
-| numpy | — | 数据处理 |
-
-## 模型规格
-
-- 架构: EMAM-SE + IA-DTP + UA-PGD
-- 参数量: ~1.4M / 模型 (d_model=128)
-- 输入: 20帧 (5Hz = 4秒历史) × 6维 [pos, vel]
-- 输出: 20帧 (4秒预测) × 3维位移
-- 推理速度: ~8ms/batch (RTX 3060, batch=1)
+详见 [`train/README.md`](train/README.md)。
 
 ## 评估结果
 
 | 测试集 | 速度 | 最佳单模型 | 软切换 | 路由 |
 |--------|------|:---------:|:-----:|:---:|
-| UAV-Flow (DJI) | 0–5 m/s | 0.555 | 0.556 | 100% → Low |
-| NPZDATA (Delivery) | 8–28 m/s | 3.10 | 3.10 | 100% → High |
+| UAV-Flow (DJI) | 0–5 m/s | RMSE=0.555 | 0.556 | 100% → Low |
+| NPZDATA (Delivery) | 8–28 m/s | RMSE=3.10 | 3.10 | 100% → High |
+
+## 模型规格
+
+- 架构: EMAM-SE + IA-DTP + UA-PGD
+- 参数量: ~1.4M / 模型 (d_model=128)
+- 输入: 20帧 (5Hz = 4秒历史) × 6D
+- 输出: 20帧 (4秒预测) × 3D位移
+- 依赖: Python >= 3.8, PyTorch >= 2.0, numpy
 
 ## License
 
