@@ -1,25 +1,5 @@
 """
-LoRA (Low-Rank Adaptation) for EMAM drone trajectory predictor.
-
-Core components:
-  LoRALinear  — wraps nn.Linear: y = Wx + (alpha/r) * B @ A @ x
-  LoRAAdapter — injects LoRA into target layers, manages Group A/B params
-  merge/unmerge — for adapter switching without reloading models
-
-Target layers (d_model=128, expand=2):
-  Group A (full finetune, tiny output heads):
-    ua_pgd.neural_decoder.delta_head    128->3
-    ua_pgd.neural_decoder.var_head.3     32->3
-    ua_pgd.anchor_to_pos.2               64->3
-    ua_pgd.physics_gate.gate_mlp.2       64->2
-
-  Group B (LoRA r=4, SSM projections):
-    emam_se.mamba_blocks.0.ssm.in_proj  128->768
-    emam_se.mamba_blocks.0.ssm.out_proj 256->128
-    emam_se.mamba_blocks.1.ssm.in_proj  128->768
-    emam_se.mamba_blocks.1.ssm.out_proj 256->128
-
-Total: ~11,051 params/drone (~44 KB fp32)
+LoRA (Low-Rank Adaptation) adapter for EMAM drone trajectory predictor.
 """
 
 import torch
@@ -29,18 +9,8 @@ from typing import Dict, List, Tuple, Optional
 import copy
 
 
-# ============================================================
-# LoRA Linear Layer
-# ============================================================
-
 class LoRALinear(nn.Module):
-    """
-    Wraps an nn.Linear with a low-rank adapter: y = Wx + (alpha/r) * B @ A @ x.
-
-    A: (in_features, r) — down-projection
-    B: (r, out_features) — up-projection
-    Initialization: A ~ Kaiming uniform, B ~ zeros (so initially LoRA output = base output)
-    """
+    """Wraps nn.Linear with a low-rank adapter: y = Wx + (alpha/r) * B @ A @ x."""
 
     def __init__(self, base_layer: nn.Linear, r: int = 4, alpha: float = 4.0,
                  dropout: float = 0.0):
@@ -58,7 +28,7 @@ class LoRALinear(nn.Module):
         if base_layer.bias is not None:
             base_layer.bias.requires_grad_(False)
 
-        # LoRA matrices (on same device as base layer)
+        # LoRA matrices: A ~ Kaiming, B ~ zeros (initially LoRA output = base output)
         device = base_layer.weight.device
         dtype = base_layer.weight.dtype
         self.lora_A = nn.Parameter(torch.empty(in_features, r, device=device, dtype=dtype))
@@ -84,7 +54,7 @@ class LoRALinear(nn.Module):
 
     @property
     def weight(self):
-        """Compatibility with code that accesses .weight on Linear layers."""
+        """Effective weight matrix: W + B^T A^T * scaling."""
         return self.base_layer.weight + (self.lora_B.T @ self.lora_A.T).T * self.scaling
 
     @property
@@ -92,24 +62,19 @@ class LoRALinear(nn.Module):
         return self.base_layer.bias
 
     def merge(self):
-        """Merge LoRA into base weights: W' = W + B @ A * scaling"""
+        """Merge LoRA into base weights: W' = W + B @ A * scaling."""
         delta = (self.lora_B.data @ self.lora_A.data.T).T * self.scaling
         self.base_layer.weight.data += delta.to(self.base_layer.weight.dtype)
-        # Zero out LoRA after merge
         self.lora_A.data.zero_()
         self.lora_B.data.zero_()
 
     def unmerge(self, saved_delta: Optional[torch.Tensor] = None):
-        """Remove LoRA from base weights."""
+        """Remove LoRA delta from base weights."""
         if saved_delta is not None:
             self.base_layer.weight.data -= saved_delta.to(self.base_layer.weight.dtype)
 
 
-# ============================================================
-# LoRA Adapter
-# ============================================================
-
-# Default target configuration
+# Default target layers — Group A (full finetune) and Group B (LoRA)
 DEFAULT_LORA_TARGETS = [
     'emam_se.mamba_blocks.0.ssm.in_proj',
     'emam_se.mamba_blocks.0.ssm.out_proj',
@@ -126,15 +91,7 @@ DEFAULT_HEAD_TARGETS = [
 
 
 class LoRAAdapter(nn.Module):
-    """
-    Injects LoRA into a TrajectoryPredictor model.
-
-    Usage:
-        adapter = LoRAAdapter(model, r=4)
-        adapter.activate()          # Replace target layers with LoRALinear
-        output = model(history)     # Forward with LoRA active
-        adapter.deactivate()        # Restore original layers
-    """
+    """Injects LoRA into target layers of a TrajectoryPredictor and manages Group A/B params."""
 
     def __init__(self, model: nn.Module, r: int = 4, alpha: float = 4.0,
                  dropout: float = 0.0,
@@ -154,7 +111,7 @@ class LoRAAdapter(nn.Module):
         self._active = False
 
     def _resolve_module(self, path: str) -> nn.Module:
-        """Resolve dotted path to a module. e.g. 'emam_se.mamba_blocks.0.ssm.in_proj'"""
+        """Resolve dotted path to a submodule, e.g. 'emam_se.mamba_blocks.0.ssm.in_proj'."""
         parts = path.split('.')
         obj = self.model
         for part in parts:
@@ -162,7 +119,7 @@ class LoRAAdapter(nn.Module):
         return obj
 
     def _set_module(self, path: str, module: nn.Module):
-        """Replace a module at dotted path."""
+        """Replace a submodule at the given dotted path."""
         parts = path.split('.')
         parent = self.model
         for part in parts[:-1]:
@@ -170,11 +127,11 @@ class LoRAAdapter(nn.Module):
         setattr(parent, parts[-1], module)
 
     def activate(self):
-        """Replace target layers with LoRALinear and store originals."""
+        """Replace target layers with LoRALinear and enable head param gradients."""
         if self._active:
             return
 
-        # Group B: Inject LoRA
+        # Group B: Inject LoRA into SSM projection layers
         for path in self.lora_targets:
             original = self._resolve_module(path)
             if not isinstance(original, nn.Linear):
@@ -184,17 +141,15 @@ class LoRAAdapter(nn.Module):
             self._set_module(path, lora_layer)
             self.lora_layers[path] = lora_layer
 
-        # Group A: Store original head params, enable grad
+        # Group A: Enable full finetuning of small output heads
         for path in self.head_targets:
             layer = self._resolve_module(path)
             if not isinstance(layer, nn.Linear):
                 raise TypeError(f"{path} is not nn.Linear, got {type(layer)}")
-            # Store original state
             self._original_head_states[path] = {
                 'weight': layer.weight.data.clone(),
                 'bias': layer.bias.data.clone() if layer.bias is not None else None,
             }
-            # Enable training for these layers
             layer.weight.requires_grad_(True)
             if layer.bias is not None:
                 layer.bias.requires_grad_(True)
@@ -205,15 +160,13 @@ class LoRAAdapter(nn.Module):
         self._active = True
 
     def deactivate(self):
-        """Restore original layers and freeze head params."""
+        """Restore original layers and freeze head parameters."""
         if not self._active:
             return
 
-        # Restore Group B original layers
         for path, original in self._original_layers.items():
             self._set_module(path, original)
 
-        # Restore Group A head params to original values and freeze
         for path, state in self._original_head_states.items():
             layer = self._resolve_module(path)
             layer.weight.data.copy_(state['weight'])
@@ -246,14 +199,14 @@ class LoRAAdapter(nn.Module):
         return state
 
     def load_lora_state(self, lora_state: Dict):
-        """Load LoRA A, B matrices from saved state."""
+        """Load LoRA A, B matrices from a saved state dict."""
         for path, matrices in lora_state.items():
             if path in self.lora_layers:
                 self.lora_layers[path].lora_A.data.copy_(matrices['A'])
                 self.lora_layers[path].lora_B.data.copy_(matrices['B'])
 
     def load_head_state(self, head_state: Dict):
-        """Load head weights from saved state."""
+        """Load head weights from a saved state dict."""
         for key, tensor in head_state.items():
             path, attr = key.rsplit('.', 1)
             layer = self._resolve_module(path)
@@ -263,7 +216,7 @@ class LoRAAdapter(nn.Module):
                 layer.bias.data.copy_(tensor)
 
     def get_trainable_params(self) -> List[nn.Parameter]:
-        """Return all trainable parameters (LoRA A,B + head params)."""
+        """Return all trainable parameters: LoRA A, B plus head params."""
         params = []
         for layer in self.lora_layers.values():
             params.extend([layer.lora_A, layer.lora_B])
@@ -271,7 +224,7 @@ class LoRAAdapter(nn.Module):
         return params
 
     def reset(self):
-        """Reset all LoRA and head parameters to initial state."""
+        """Reset all LoRA and head parameters to their initial state."""
         for layer in self.lora_layers.values():
             layer.reset_lora_parameters()
         for path, state in self._original_head_states.items():
@@ -289,27 +242,18 @@ class LoRAAdapter(nn.Module):
         return self._active
 
 
-# ============================================================
-# Merge / Unmerge utilities (for adapter switching)
-# ============================================================
-
 def merge_lora(adapter: LoRAAdapter):
-    """Merge LoRA weights into base model permanently."""
+    """Merge LoRA weights into the base model permanently."""
     for layer in adapter.lora_layers.values():
         layer.merge()
-    # Head params are already "merged" (they're full finetune)
-    adapter._original_layers.clear()
+
 
 def unmerge_lora(adapter: LoRAAdapter, saved_deltas: Dict[str, torch.Tensor]):
-    """Remove LoRA contribution from base model."""
+    """Remove LoRA contribution from the base model."""
     for path, delta in saved_deltas.items():
         if path in adapter.lora_layers:
             adapter.lora_layers[path].unmerge(delta)
 
-
-# ============================================================
-# Convenience function
-# ============================================================
 
 def create_lora_model(model: nn.Module, r: int = 4, alpha: float = 4.0,
                       lora_targets: List[str] = None,
@@ -321,9 +265,6 @@ def create_lora_model(model: nn.Module, r: int = 4, alpha: float = 4.0,
     return adapter
 
 
-# ============================================================
-# Smoke test
-# ============================================================
 if __name__ == '__main__':
     import sys
     from pathlib import Path
@@ -350,7 +291,7 @@ if __name__ == '__main__':
     with torch.no_grad():
         out_base = model(x, force_predict=True)
 
-    # Reset LoRA (B=0) → output should match base
+    # Reset LoRA (B=0) -> output should match base
     adapter.reset()
     with torch.no_grad():
         out_lora_zero = model(x, force_predict=True)

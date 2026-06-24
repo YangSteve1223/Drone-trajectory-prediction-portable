@@ -1,20 +1,4 @@
-"""
-Safety & Risk Assessment Module for Drone Trajectory Prediction.
-
-Three capabilities:
-  1. RiskAssessment  — geofence distance + risk level (LOW/MEDIUM/HIGH)
-  2. AnomalyDetector — prediction-vs-actual deviation + CUSUM escalation
-  3. InputValidator  — shape/range checks for predictor inputs
-
-Usage:
-    from safety import RiskAssessment, AnomalyDetector
-
-    ra = RiskAssessment(geofence_bounds={...})
-    risk = ra.evaluate(predicted_trajectory, current_position)
-
-    ad = AnomalyDetector()
-    alert = ad.check(predicted, actual, drone_id)
-"""
+"""Safety & Risk Assessment: geofence checking, anomaly detection, and input validation."""
 
 import torch
 import torch.nn.functional as F
@@ -24,10 +8,6 @@ from dataclasses import dataclass, field
 from collections import deque
 from enum import Enum
 
-
-# ============================================================
-# Risk Level Types
-# ============================================================
 
 class RiskLevel(Enum):
     LOW = "low"
@@ -47,30 +27,10 @@ class RiskResult:
     alert: bool                 # immediate action required
 
 
-# ============================================================
-# 1. Risk Assessment — Geofence Boundary Distance
-# ============================================================
-
 class RiskAssessment:
-    """
-    Evaluate risk of predicted trajectory crossing geofence boundaries.
+    """Evaluate risk of predicted trajectory crossing geofence boundaries.
 
-    Supports multiple boundary types:
-      - cylinder: circular no-fly zone (center, radius, floor, ceiling)
-      - box: rectangular restricted area (min_xyz, max_xyz)
-      - sphere: spherical keep-out zone (center, radius)
-
-    Parameters
-    ----------
-    boundaries : list of dict
-        Each dict defines one geofence boundary.
-        cylinder: {'type':'cylinder','center':(x,y),'radius':r,'floor':z0,'ceiling':z1}
-        box:      {'type':'box','min':(x,y,z),'max':(x,y,z)}
-        sphere:   {'type':'sphere','center':(x,y,z),'radius':r}
-    warning_margin : float
-        Distance margin for early warning (meters). Default 5.0m.
-    critical_margin : float
-        Distance margin for critical alert (meters). Default 1.0m.
+    Supports cylinder, box, and sphere boundary types.
     """
 
     def __init__(self, boundaries: List[dict] = None,
@@ -148,17 +108,7 @@ class RiskAssessment:
     def evaluate(self, predicted_trajectory: torch.Tensor,
                  current_position: torch.Tensor = None,
                  dt: float = 0.2) -> RiskResult:
-        """
-        Evaluate risk for a predicted trajectory.
-
-        Args:
-            predicted_trajectory: (B, pred_len, 3) future displacement in meters.
-            current_position: (B, 3) current absolute position. If None, assume origin.
-            dt: Time step between prediction frames (seconds). Default 0.2s (5Hz).
-
-        Returns:
-            RiskResult with level, min_distance, time_to_violation, etc.
-        """
+        """Evaluate risk for a predicted trajectory (B, pred_len, 3) against all known boundaries."""
         if not self.boundaries:
             return RiskResult(level=RiskLevel.LOW, min_distance=float('inf'),
                             time_to_violation=float('inf'), violating_steps=[],
@@ -236,30 +186,11 @@ class RiskAssessment:
         )
 
 
-# ============================================================
-# 2. Anomaly Detector — Prediction-vs-Actual Deviation
-# ============================================================
-
 class AnomalyDetector:
-    """
-    Detect anomalous flight behavior via prediction error monitoring.
+    """Detect anomalous flight behavior via prediction error monitoring.
 
-    Combines:
-      - Moving average of prediction error
-      - Adaptive threshold based on historical error distribution (μ + k*σ)
-      - CUSUM escalation for sustained deviation
-      - Drone-specific baselines
-
-    Parameters
-    ----------
-    window_size : int
-        Number of recent errors for moving statistics. Default 50.
-    sigma_multiplier : float
-        Anomaly threshold = mean_error + sigma_multiplier * std_error. Default 3.0.
-    cusum_threshold : float
-        CUSUM trigger threshold. Default 5.0.
-    min_samples : int
-        Minimum samples before anomaly detection starts. Default 20.
+    Combines moving-average error tracking, adaptive thresholding (mu + k*sigma),
+    and CUSUM escalation for sustained deviation.
     """
 
     def __init__(self, window_size: int = 50, sigma_multiplier: float = 3.0,
@@ -278,17 +209,7 @@ class AnomalyDetector:
 
     def check(self, predicted: torch.Tensor, actual: torch.Tensor,
               drone_id: str = "default") -> Dict:
-        """
-        Check if current prediction error indicates anomaly.
-
-        Args:
-            predicted: (B, pred_len, 3) predicted displacement.
-            actual: (B, pred_len, 3) actual/ground-truth displacement.
-            drone_id: Unique drone identifier.
-
-        Returns:
-            dict with: is_anomaly, error, threshold, cusum_active, alert_count, level
-        """
+        """Check if current prediction error indicates an anomaly for a given drone."""
         # Move to same device if needed
         if predicted.device != actual.device:
             actual = actual.to(predicted.device)
@@ -323,7 +244,7 @@ class AnomalyDetector:
         # Adaptive threshold
         threshold = mean_err + self.sigma_multiplier * std_err
 
-        # CUSUM update
+        # CUSUM update — accumulate sustained deviation above mean
         deviation = error_val - mean_err
         self._cusum_pos[drone_id] = max(0.0, self._cusum_pos[drone_id] + deviation - std_err)
         self._cusum_neg[drone_id] = max(0.0, self._cusum_neg[drone_id] - deviation - std_err)
@@ -372,24 +293,8 @@ class AnomalyDetector:
         return self._baseline.get(drone_id)
 
 
-# ============================================================
-# 3. Input Validator
-# ============================================================
-
 class InputValidator:
-    """
-    Validate input tensors before model inference.
-
-    Checks:
-      - Shape correctness (must be (B, 20, 6))
-      - Value ranges (position ~100m, velocity ~30m/s)
-      - NaN/Inf detection
-      - Device consistency
-
-    Usage:
-        validator = InputValidator()
-        hist = validator.validate(hist)  # Returns validated tensor or raises
-    """
+    """Validate input tensors before model inference: shape, range, NaN/Inf checks."""
 
     # Reasonable physical ranges for drone trajectories
     DEFAULT_POS_RANGE = (-1000.0, 1000.0)   # meters
@@ -407,21 +312,10 @@ class InputValidator:
         self._warnings: List[str] = []
 
     def validate(self, hist: torch.Tensor) -> torch.Tensor:
-        """
-        Validate and sanitize input tensor.
-
-        Args:
-            hist: (B, 20, 6) history tensor [pos_x,pos_y,pos_z, vx,vy,vz].
-
-        Returns:
-            Validated (possibly clipped) tensor.
-
-        Raises:
-            ValueError if input is fundamentally invalid (wrong shape, all NaN).
-        """
+        """Validate and sanitize input tensor (B, 20, 6)."""
         self._warnings.clear()
 
-        # --- Shape check ---
+        # Shape check
         if hist.dim() != 3:
             raise ValueError(f"Expected 3D tensor (B, 20, 6), got shape {hist.shape}")
         B, T, D = hist.shape
@@ -431,7 +325,7 @@ class InputValidator:
                 f"got ({B}, {T}, {D})"
             )
 
-        # --- NaN/Inf check ---
+        # NaN/Inf check
         nan_mask = torch.isnan(hist)
         inf_mask = torch.isinf(hist)
         if nan_mask.any():
@@ -449,7 +343,7 @@ class InputValidator:
             self._warnings.append(msg)
             hist = torch.clamp(hist, min=-1e6, max=1e6)
 
-        # --- Position range check ---
+        # Position range check
         pos = hist[:, :, :3]
         pos_min, pos_max = self.pos_range
         if pos.min() < pos_min or pos.max() > pos_max:
@@ -460,7 +354,7 @@ class InputValidator:
             self._warnings.append(msg)
             hist[:, :, :3] = torch.clamp(hist[:, :, :3], min=pos_min, max=pos_max)
 
-        # --- Velocity range check ---
+        # Velocity range check
         vel = hist[:, :, 3:6]
         vel_min, vel_max = self.vel_range
         if vel.min() < vel_min or vel.max() > vel_max:
@@ -481,19 +375,8 @@ class InputValidator:
         self._warnings.clear()
 
 
-# ============================================================
-# Convenience: select best available device
-# ============================================================
-
 def get_best_device(verbose: bool = True) -> torch.device:
-    """
-    Select the best available compute device.
-
-    Priority: CUDA > MPS (Apple Silicon) > CPU
-
-    Returns:
-        torch.device
-    """
+    """Select the best available compute device: CUDA > MPS (Apple Silicon) > CPU."""
     if torch.cuda.is_available():
         device = torch.device('cuda')
         name = torch.cuda.get_device_name(0)
@@ -511,9 +394,7 @@ def get_best_device(verbose: bool = True) -> torch.device:
     return device
 
 
-# ============================================================
 # Smoke Test
-# ============================================================
 if __name__ == '__main__':
     print('=== Safety Module Smoke Test ===\n')
 

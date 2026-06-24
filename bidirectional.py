@@ -1,27 +1,5 @@
 """
-Bidirectional Mamba Enhancer — plug-in for DronePredictor.
-
-Adds bidirectional temporal context to the standard unidirectional EMAM encoder.
-The bidirectional branch processes the same input in both forward and backward
-directions, then fuses features via a learnable gate.
-
-Architecture:
-    Input (B,T,6) ──→ EMAM-SE (unidirectional) ──→ encoded (B,T,D)
-         │
-         └─────→ BidirectionalMambaEncoder ──→ bi_features (B,T,D)
-                           │
-                   Gated Fusion: gate*forward + (1-gate)*backward
-                           │
-                   encoded + bi_features → enhanced output
-
-Usage:
-    from bidirectional import BidirectionalPredictor
-    bp = BidirectionalPredictor(predictor)  # wraps DronePredictor
-    out = bp.predict(history)
-
-Note: The bidirectional encoder has its own weights (~500K params) that need
-training. Without training, it starts near-zero (output_proj initialized small)
-so existing predictions are minimally affected.
+Bidirectional Mamba Enhancer plug-in for DronePredictor. Adds bidirectional temporal context via a learnable gate.
 """
 
 import torch
@@ -35,15 +13,7 @@ from emam_model.bidirectional_mamba import BidirectionalMambaEncoder
 class BidirectionalEnhancer(nn.Module):
     """
     Lightweight bidirectional feature enhancer.
-
-    Takes raw trajectory input, runs bidirectional SSM, and produces
-    an enhancement residual that can be added to the encoder output.
-
-    Args:
-        d_model: Feature dimension (must match the base model, default 128).
-        d_state: SSM state dimension.
-        expand: Expansion factor for SSM inner dimension.
-        freeze: If True, start with near-zero contribution (safe for inference).
+    Takes raw trajectory input, runs bidirectional SSM, produces an enhancement residual.
     """
 
     def __init__(self, d_model: int = 128, d_state: int = 16,
@@ -51,15 +21,13 @@ class BidirectionalEnhancer(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # Input projection to match model's d_model
         self.input_proj = nn.Linear(6, d_model)
 
-        # Bidirectional encoder
         self.bi_encoder = BidirectionalMambaEncoder(
             d_model=d_model, d_state=d_state, expand=expand,
         )
 
-        # Output scaling — starts small so untrained model has minimal effect
+        # Output scaling starts small so untrained model has minimal effect
         self.output_scale = nn.Parameter(torch.tensor(0.01))
 
         if freeze:
@@ -67,27 +35,15 @@ class BidirectionalEnhancer(nn.Module):
 
     def _init_near_zero(self):
         """Initialize output layers small so untrained enhancer doesn't disrupt."""
-        # Small random init for output_proj
         for name, param in self.bi_encoder.named_parameters():
             if 'out_proj' in name or 'residual_proj' in name:
                 nn.init.normal_(param, std=0.001)
         self.output_scale.data.fill_(0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, T, 6) raw trajectory input (same as model input).
-
-        Returns:
-            bi_features: (B, T, d_model) bidirectional enhancement residual.
-        """
-        # Project to model space
+        """x: (B, T, 6) raw trajectory input. Returns (B, T, d_model) bidirectional enhancement residual."""
         projected = self.input_proj(x)
-
-        # Bidirectional encoding
         _, _, fused = self.bi_encoder(projected)
-
-        # Scale down to not overwhelm base model (until trained)
         return fused * self.output_scale
 
     @property
@@ -102,17 +58,8 @@ class BidirectionalEnhancer(nn.Module):
 class BidirectionalPredictor:
     """
     DronePredictor wrapper with bidirectional context enhancement.
-
-    The bidirectional branch provides additional temporal context by
-    processing the trajectory in both directions. This is particularly
-    useful for:
-    - Long-range predictions (steps 15-20) where future context helps
-    - Maneuver transitions where backward context resolves ambiguity
-    - Hovering/loitering patterns where bidirectional motion is symmetric
-
-    Note: The bidirectional enhancer has ~500K trainable parameters.
-    Training it requires a short fine-tuning phase on your dataset.
-    For zero-shot use, it adds a small bias (output_scale=0.01).
+    The bidirectional branch provides additional temporal context by processing
+    the trajectory in both directions, helping long-range predictions and maneuver transitions.
     """
 
     def __init__(self, predictor, d_model: int = 128):
@@ -138,7 +85,6 @@ class BidirectionalPredictor:
         def enhanced_forward(x):
             base_encoded = self._original_encoder_forward(x)
             bi = enhancer(x)
-            # Add bidirectional residual (bi is (B,T,D), same shape as base_encoded)
             return base_encoded + bi
 
         encoder.forward = enhanced_forward
@@ -169,17 +115,8 @@ class BidirectionalPredictor:
     def train_enhancer(self, train_loader, epochs: int = 5, lr: float = 1e-4,
                        amp: bool = True):
         """
-        Train the bidirectional enhancer.
-
-        Fine-tunes only the bidirectional branch (~122K params).
-        Base model weights remain frozen. Bi-directional features are
-        injected as a residual into the encoder output.
-
-        Args:
-            train_loader: DataLoader yielding (history, future_gt, intent).
-            epochs: Number of training epochs.
-            lr: Learning rate.
-            amp: Use automatic mixed precision.
+        Train the bidirectional enhancer. Fine-tunes only the bidirectional branch;
+        base model weights remain frozen.
         """
         self.enhancer.enable_training()
         self.enhancer.train()
@@ -188,7 +125,6 @@ class BidirectionalPredictor:
         for param in self.predictor.mixed.parameters():
             param.requires_grad_(False)
 
-        # Inject hook so bi_features flow through the model
         self._inject_hook()
 
         optimizer = torch.optim.AdamW(self.enhancer.parameters(), lr=lr,
@@ -241,7 +177,6 @@ class BidirectionalPredictor:
                 }, save_path)
                 print(f'  -> Best saved: {save_path}')
 
-        # Cleanup
         self.enhancer.eval()
         self._remove_hook()
         for param in self.predictor.mixed.parameters():
@@ -255,9 +190,6 @@ class BidirectionalPredictor:
         return self._trained
 
 
-# ============================================================
-# Smoke Test
-# ============================================================
 if __name__ == '__main__':
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -271,7 +203,6 @@ if __name__ == '__main__':
     print(f'Enhancer params: {bp.enhancer.num_params:,}')
     print(f'Trained: {bp.trained}')
 
-    # Standard prediction (enhancer starts frozen → near-zero effect)
     x = torch.randn(2, 20, 6)
     x[:, :, 3:6] *= 2.0
 

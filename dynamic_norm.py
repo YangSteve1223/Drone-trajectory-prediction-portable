@@ -1,16 +1,5 @@
 """
-Dynamic Spatial Adaptive Normalization for Drone Trajectory Prediction.
-
-Problem: Fixed _scale_pos=100.0 is hardcoded in model.py. This works for
-NPZDATA (pos ±192m) but fails for UAV-Flow (pos ±7m) and scaled data.
-
-Solution: Per-window dynamic normalization based on local trajectory statistics.
-  - Origin: first frame of the window → zero-center positions
-  - Scale:  derived from window velocity statistics → adaptive to speed
-  - Output: inverse transform maps predictions back to real coordinates
-
-Architecture:
-  Input (real coords) → normalize() → model (unit-scale) → denormalize() → Output (real)
+Per-window dynamic normalization for trajectory data. Adapts scale to local velocity statistics.
 """
 
 import torch
@@ -19,18 +8,11 @@ from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 
 
-# ============================================================
-# Configuration
-# ============================================================
-
 @dataclass
 class NormConfig:
     """Normalization configuration for a specific dataset or deployment."""
 
     # Scale computation method
-    # "velocity":  scale = mean_speed * pred_len  (recommended, physics-based)
-    # "displacement": scale = max(displacement_in_window)  (data-driven)
-    # "fixed": scale = fixed value (backward compatible)
     method: str = "velocity"
 
     # Fixed scales (used when method="fixed" or as fallback)
@@ -38,42 +20,27 @@ class NormConfig:
     fixed_vel_scale: float = 10.0
 
     # Safety bounds for dynamic scale
-    min_pos_scale: float = 1.0      # minimum scale (meters) — for hovering
-    max_pos_scale: float = 1000.0   # maximum scale — cap for extreme speeds
+    min_pos_scale: float = 1.0
+    max_pos_scale: float = 1000.0
     min_vel_scale: float = 0.1
     max_vel_scale: float = 100.0
 
     # Time parameters
-    dt: float = 0.2                 # seconds per frame (5Hz)
-    pred_len: int = 20              # prediction horizon frames
+    dt: float = 0.2
+    pred_len: int = 20
 
     # Smoothing: EMA factor for scale (0=no smoothing, 0.9=heavy smoothing)
     scale_smoothing: float = 0.7
 
     # Zero-centering
-    center_on_first: bool = True    # Use first frame as origin
-    center_on_mean: bool = False    # Use window mean as origin (alternative)
+    center_on_first: bool = True
+    center_on_mean: bool = False
 
-
-# ============================================================
-# Dynamic Normalizer
-# ============================================================
 
 class DynamicNormalizer:
     """
-    Per-window dynamic normalization for trajectory data.
-
-    Normalization formula:
-      pos_norm = (pos - origin) / scale_pos
-      vel_norm = vel / scale_vel
-
-    Where:
-      origin = first frame position (if center_on_first)
-      scale_pos = mean(|vel|) * pred_len (if method="velocity")
-      scale_vel = scale_pos / pred_len
-
-    Inverse:
-      pos_real = pos_norm * scale_pos + origin
+    Per-window dynamic normalization.
+    Normalization: pos_norm = (pos - origin) / scale_pos, vel_norm = vel / scale_vel.
     """
 
     def __init__(self, config: NormConfig = None):
@@ -82,17 +49,7 @@ class DynamicNormalizer:
         self._last_origin: Optional[torch.Tensor] = None
 
     def compute_params(self, history: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
-        """
-        Compute normalization parameters from a history window.
-
-        Args:
-            history: (B, 20, 6) [pos_x,pos_y,pos_z, vx,vy,vz] in real meters, m/s.
-
-        Returns:
-            origin: (B, 3) origin position for zero-centering.
-            scale_pos: float, position scale factor.
-            scale_vel: float, velocity scale factor.
-        """
+        """Compute origin, scale_pos, scale_vel from a history window (B, 20, 6)."""
         cfg = self.config
         B = history.shape[0]
         device = history.device
@@ -100,26 +57,23 @@ class DynamicNormalizer:
         pos = history[:, :, :3]  # (B, 20, 3)
         vel = history[:, :, 3:6]  # (B, 20, 3)
 
-        # --- Origin ---
+        # Origin
         if cfg.center_on_first:
-            origin = pos[:, 0, :]  # (B, 3) — first frame
+            origin = pos[:, 0, :]
         elif cfg.center_on_mean:
-            origin = pos.mean(dim=1)  # (B, 3) — window mean
+            origin = pos.mean(dim=1)
         else:
             origin = torch.zeros(B, 3, device=device)
 
-        # --- Scale ---
+        # Scale
         if cfg.method == "velocity":
-            # Scale = mean speed over last 10 frames * pred_len
-            # This gives the expected displacement range
-            recent_vel = vel[:, -10:, :]  # last 10 frames for stability
+            recent_vel = vel[:, -10:, :]
             mean_speed = torch.norm(recent_vel, dim=2).mean(dim=1)  # (B,)
             scale_pos = mean_speed * cfg.pred_len * cfg.dt
 
         elif cfg.method == "displacement":
-            # Scale = max displacement within the window
-            disp = pos[:, -1, :] - pos[:, 0, :]  # (B, 3) total displacement
-            scale_pos = torch.norm(disp, dim=1)  # (B,)
+            disp = pos[:, -1, :] - pos[:, 0, :]
+            scale_pos = torch.norm(disp, dim=1)
 
         elif cfg.method == "fixed":
             scale_pos = torch.full((B,), cfg.fixed_pos_scale, device=device)
@@ -139,10 +93,9 @@ class DynamicNormalizer:
             avg_scale = float(scale_pos)
         smoothed = cfg.scale_smoothing * self._last_scale_pos + (1 - cfg.scale_smoothing) * avg_scale
         self._last_scale_pos = smoothed
-        # Broadcast smoothed value to all batch elements
         scale_pos = torch.full((B,), smoothed, device=device)
 
-        # Velocity scale derived from SMOOTHED position scale
+        # Velocity scale derived from smoothed position scale
         scale_vel = scale_pos / cfg.pred_len
         scale_vel = torch.clamp(scale_vel,
                                min=cfg.min_vel_scale,
@@ -151,21 +104,11 @@ class DynamicNormalizer:
         return origin, scale_pos, scale_vel
 
     def normalize(self, history: torch.Tensor) -> Tuple[torch.Tensor, dict]:
-        """
-        Normalize history window.
-
-        Args:
-            history: (B, 20, 6) real coordinates.
-
-        Returns:
-            normalized: (B, 20, 6) normalized coordinates.
-            params: dict with origin, scale_pos, scale_vel for inverse.
-        """
+        """Normalize history window. Returns normalized tensor and params dict."""
         origin, s_pos, s_vel = self.compute_params(history)
         B = history.shape[0]
         device = history.device
 
-        # Convert to tensor if scalar (from EMA smoothing)
         if isinstance(s_pos, (int, float)):
             s_pos = torch.full((B,), s_pos, device=device)
         if isinstance(s_vel, (int, float)):
@@ -179,34 +122,26 @@ class DynamicNormalizer:
         s_vel_3d = s_vel.view(B, 1, 1)
         origin_3d = origin.view(B, 1, 3)
 
-        # Normalize
         hist_norm = history.clone()
+        # pos_norm = (pos - origin) / scale_pos
         hist_norm[:, :, :3] = (history[:, :, :3] - origin_3d) / s_pos_3d
+        # vel_norm = vel / scale_vel
         hist_norm[:, :, 3:6] = history[:, :, 3:6] / s_vel_3d
 
         params = {
-            'origin': origin,        # (B, 3)
-            'scale_pos': s_pos,      # (B,) or float
-            'scale_vel': s_vel,      # (B,) or float
+            'origin': origin,
+            'scale_pos': s_pos,
+            'scale_vel': s_vel,
         }
 
         return hist_norm, params
 
     def denormalize(self, predictions: torch.Tensor, params: dict) -> torch.Tensor:
-        """
-        Convert normalized predictions back to real displacement.
-
-        Args:
-            predictions: (B, pred_len, 3) normalized displacement.
-            params: dict from normalize().
-
-        Returns:
-            real_predictions: (B, pred_len, 3) real displacement in meters.
-        """
+        """Convert normalized displacement predictions back to real meters."""
         return predictions * self._get_scale_tensor(params['scale_pos'], predictions)
 
     def _get_scale_tensor(self, scale, ref: torch.Tensor):
-        """Helper: ensure scale is a tensor broadcastable to (B, 1, 1)."""
+        """Ensure scale is a tensor broadcastable to (B, 1, 1)."""
         B = ref.shape[0]
         if isinstance(scale, (int, float)):
             scale = torch.full((B,), scale, device=ref.device, dtype=ref.dtype)
@@ -217,9 +152,7 @@ class DynamicNormalizer:
         return scale.view(B, 1, 1)
 
     def denormalize_absolute(self, predictions: torch.Tensor, params: dict) -> torch.Tensor:
-        """
-        Convert normalized predictions to absolute real-world positions.
-        """
+        """Convert normalized predictions to absolute real-world positions."""
         B = predictions.shape[0]
         origin = params['origin'].to(predictions.device)
         if origin.dim() == 2:
@@ -243,28 +176,11 @@ class DynamicNormalizer:
         return self._last_origin
 
 
-# ============================================================
-# Scale-Invariant Loss
-# ============================================================
-
 def scale_invariant_mse(pred: torch.Tensor, target: torch.Tensor,
                          eps: float = 1e-8) -> torch.Tensor:
     """
-    Scale-Invariant MSE loss.
-
-    SI-MSE = MSE(log(pred), log(target))
-           = MSE( pred/s, target/s )  where s = mean(target)
-
-    This makes the loss independent of the absolute scale of the trajectory,
-    focusing on the relative motion pattern (turns, accelerations).
-
-    Args:
-        pred: (B, T, 3) predicted displacement.
-        target: (B, T, 3) ground truth displacement.
-        eps: small constant for numerical stability.
-
-    Returns:
-        scalar loss value.
+    Scale-Invariant MSE loss: SI-MSE = MSE(pred/s, target/s) where s = mean(|target|).
+    Independent of absolute trajectory scale; focuses on relative motion pattern.
     """
     # Per-sample scale: mean absolute displacement
     scale = target.abs().mean(dim=[1, 2], keepdim=True) + eps  # (B, 1, 1)
@@ -282,20 +198,17 @@ def scale_invariant_l1(pred: torch.Tensor, target: torch.Tensor,
     return nn.functional.l1_loss(pred / scale, target / scale)
 
 
-# ============================================================
-# Smoke Test
-# ============================================================
 if __name__ == '__main__':
     print('=== Dynamic Normalizer Smoke Test ===\n')
 
-    # Test 1: Low-speed UAV-Flow scenario (~1 m/s)
+    # Low-speed scenario (UAV-Flow, ~1 m/s)
     print('--- Low-speed scenario (UAV-Flow, ~1 m/s) ---')
     cfg = NormConfig(method="velocity", center_on_first=True)
     norm = DynamicNormalizer(cfg)
 
     hist_low = torch.randn(2, 20, 6)
-    hist_low[:, :, :3] = torch.cumsum(torch.randn(2, 20, 3) * 0.2, dim=1)  # ~1 m/s drift
-    hist_low[:, :, 3:6] = torch.randn(2, 20, 3) * 0.3 + 1.0  # ~1 m/s velocity
+    hist_low[:, :, :3] = torch.cumsum(torch.randn(2, 20, 3) * 0.2, dim=1)
+    hist_low[:, :, 3:6] = torch.randn(2, 20, 3) * 0.3 + 1.0
 
     norm_hist, params = norm.normalize(hist_low)
     sp = params['scale_pos']; sv = params['scale_vel']
@@ -305,13 +218,12 @@ if __name__ == '__main__':
     print(f'  norm_pos range: [{norm_hist[:,:,:3].min():.2f}, {norm_hist[:,:,:3].max():.2f}]')
     print(f'  norm_vel range: [{norm_hist[:,:,3:].min():.2f}, {norm_hist[:,:,3:].max():.2f}]')
 
-    # Denormalize and check roundtrip
-    pred_norm = torch.randn(2, 20, 3) * 0.1  # simulated normalized prediction
+    pred_norm = torch.randn(2, 20, 3) * 0.1
     pred_real = norm.denormalize(pred_norm, params)
     print(f'  pred_norm range: [{pred_norm.min():.2f}, {pred_norm.max():.2f}]')
     print(f'  pred_real range: [{pred_real.min():.2f}, {pred_real.max():.2f}]')
 
-    # Test 2: High-speed NPZDATA scenario (~20 m/s)
+    # High-speed scenario (NPZDATA, ~20 m/s)
     print('\n--- High-speed scenario (NPZDATA, ~20 m/s) ---')
     hist_high = torch.randn(2, 20, 6)
     hist_high[:, :, :3] = torch.cumsum(torch.randn(2, 20, 3) * 4.0, dim=1)
@@ -323,7 +235,7 @@ if __name__ == '__main__':
     print(f'  scale_pos={sp2_val:.0f}')
     print(f'  norm_pos range: [{norm_hist2[:,:,:3].min():.2f}, {norm_hist2[:,:,:3].max():.2f}]')
 
-    # Test 3: Hovering edge case (near-zero velocity)
+    # Hovering edge case (near-zero velocity)
     print('\n--- Hovering scenario (~0.01 m/s) ---')
     hist_hover = torch.randn(2, 20, 6) * 0.001
     hist_hover[:, :, 3:6] *= 0.01
@@ -332,16 +244,16 @@ if __name__ == '__main__':
     sp3_val = sp3[0].item() if isinstance(sp3, torch.Tensor) and sp3.numel() > 0 else float(sp3)
     print(f'  scale_pos={sp3_val:.2f} (should be >= min_pos_scale={cfg.min_pos_scale})')
 
-    # Test 4: Scale-Invariant Loss
+    # Scale-Invariant Loss
     print('\n--- Scale-Invariant Loss ---')
     pred = torch.randn(2, 20, 3) * 10
     target = torch.randn(2, 20, 3) * 10
     si_loss = scale_invariant_mse(pred, target)
     mse_loss = nn.functional.mse_loss(pred, target)
-    print(f'  SI-MSE: {si_loss:.4f} (scale-independent, should be ~0-2)')
+    print(f'  SI-MSE: {si_loss:.4f} (scale-independent)')
     print(f'  Raw MSE: {mse_loss:.4f} (depends on absolute scale)')
 
-    # Test: SI-MSE with same pattern at different scales should be similar
+    # SI-MSE with same pattern at different scales should be similar
     pred_a = torch.randn(1, 20, 3)
     target_a = torch.randn(1, 20, 3)
     pred_b = pred_a * 50
@@ -349,6 +261,6 @@ if __name__ == '__main__':
     si_a = scale_invariant_mse(pred_a, target_a)
     si_b = scale_invariant_mse(pred_b, target_b)
     print(f'  SI-MSE same pattern @ 1x: {si_a:.4f}')
-    print(f'  SI-MSE same pattern @ 50x: {si_b:.4f} (should be ≈ same)')
+    print(f'  SI-MSE same pattern @ 50x: {si_b:.4f} (should be approx same)')
 
     print('\nAll tests passed!')

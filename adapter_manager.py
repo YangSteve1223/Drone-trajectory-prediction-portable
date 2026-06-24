@@ -1,14 +1,5 @@
 """
-Drone Adapter Manager — per-drone LoRA state management.
-
-Manages the lifecycle of LoRA adapters for multiple drones:
-  - Create, load, save, delete per-drone adapters
-  - Replay buffer for catastrophic forgetting protection
-  - CUSUM detector for prediction degradation monitoring
-  - Optimizer state persistence
-
-Storage: checkpoints/adapters/{drone_id}.pt + index.json
-Per-drone disk footprint: ~50 KB
+Drone Adapter Manager for per-drone LoRA state management, replay buffer, and CUSUM monitoring.
 """
 
 import torch
@@ -25,28 +16,20 @@ import os
 from lora import LoRAAdapter, DEFAULT_LORA_TARGETS, DEFAULT_HEAD_TARGETS
 
 
-# ============================================================
-# Data structures
-# ============================================================
-
 @dataclass
 class TrajectorySample:
     """Single trajectory observation for online learning."""
-    history: torch.Tensor      # (20, 6)  past trajectory
-    future_gt: torch.Tensor    # (20, 3)  ground truth future displacement
-    intent: int = 0            # intent label (optional)
-    timestep: int = 0          # observation timestep
-    confidence: float = 1.0    # model confidence at observation time
+    history: torch.Tensor      # (20, 6)
+    future_gt: torch.Tensor    # (20, 3)
+    intent: int = 0
+    timestep: int = 0
+    confidence: float = 1.0
 
     def to(self, device):
         self.history = self.history.to(device)
         self.future_gt = self.future_gt.to(device)
         return self
 
-
-# ============================================================
-# Replay Buffer
-# ============================================================
 
 class ReplayBuffer:
     """Fixed-capacity FIFO buffer for experience replay."""
@@ -86,22 +69,16 @@ class ReplayBuffer:
         return buf
 
 
-# ============================================================
-# CUSUM Detector
-# ============================================================
-
 class CUSUMDetector:
     """
     Two-sided CUSUM for detecting sustained prediction degradation.
-
-    When prediction error stays above baseline for an extended period,
-    CUSUM accumulates and eventually triggers → escalate adaptation.
+    Accumulates when error exceeds baseline; triggers escalation.
     """
 
     def __init__(self, threshold: float = 3.0, drift: float = 1.0,
                  window: int = 50):
         self.threshold = threshold
-        self.drift = drift          # allowable drift before accumulation
+        self.drift = drift
         self.window = window
         self.reset()
 
@@ -114,10 +91,7 @@ class CUSUMDetector:
         self.triggered = False
 
     def update(self, error: float) -> bool:
-        """
-        Update CUSUM with new prediction error.
-        Returns True if CUSUM triggers (sustained degradation detected).
-        """
+        """Update CUSUM with new prediction error. Returns True if triggered."""
         self.error_history.append(error)
         if len(self.error_history) < 5:
             return False
@@ -125,7 +99,7 @@ class CUSUMDetector:
         # Baseline: running mean of recent errors
         self.mean_error = sum(self.error_history) / len(self.error_history)
 
-        # CUSUM update
+        # CUSUM update: deviation = error - mean_error
         deviation = error - self.mean_error
         self.pos_sum = max(0.0, self.pos_sum + deviation - self.drift)
         self.neg_sum = max(0.0, self.neg_sum - deviation - self.drift)
@@ -160,10 +134,6 @@ class CUSUMDetector:
         self.triggered = d['triggered']
 
 
-# ============================================================
-# Drone Adapter Manager
-# ============================================================
-
 @dataclass
 class DroneState:
     """All persisted state for one drone."""
@@ -177,16 +147,7 @@ class DroneState:
 
 
 class DroneAdapterManager:
-    """
-    Manages LoRA adapters for multiple drones.
-
-    Usage:
-        mgr = DroneAdapterManager(base_model, checkpoint_dir='adapters')
-        mgr.activate('drone_001')           # Apply drone's LoRA to model
-        model(history)                       # Inference with adaptation
-        mgr.deactivate()                     # Remove LoRA
-        mgr.save('drone_001')               # Persist to disk
-    """
+    """Manages LoRA adapters for multiple drones: create, load, save, delete."""
 
     def __init__(self, base_model: nn.Module,
                  checkpoint_dir: str = 'checkpoints/adapters',
@@ -202,11 +163,9 @@ class DroneAdapterManager:
         self.lora_targets = lora_targets or DEFAULT_LORA_TARGETS
         self.head_targets = head_targets or DEFAULT_HEAD_TARGETS
 
-        # Currently active drone (None if no adapter applied)
         self._active_drone: Optional[str] = None
         self._adapter: Optional[LoRAAdapter] = None
 
-        # Index file: {drone_id: {created, last_update, num_updates, ...}}
         self._index_path = self.checkpoint_dir / 'index.json'
         self._index: Dict[str, Dict] = self._load_index()
 
@@ -223,35 +182,24 @@ class DroneAdapterManager:
     def _drone_path(self, drone_id: str) -> Path:
         return self.checkpoint_dir / f'{drone_id}.pt'
 
-    # ---- Activation ----
-
     def activate(self, drone_id: str) -> bool:
-        """
-        Apply this drone's LoRA adapter to the base model.
-        If drone doesn't exist yet, create a fresh zero-initialized adapter.
-
-        Returns True if adapter was newly created.
-        """
-        # Deactivate any currently active adapter first
+        """Apply this drone's LoRA adapter to the base model. Returns True if newly created."""
         if self._active_drone is not None:
             self.deactivate()
 
         is_new = not self._drone_path(drone_id).exists()
 
-        # Create fresh adapter
         self._adapter = LoRAAdapter(
             self.base_model, r=self.r, alpha=self.alpha,
             lora_targets=self.lora_targets, head_targets=self.head_targets,
         )
         self._adapter.activate()
 
-        # Load saved state if exists
         if not is_new:
             self.load(drone_id)
 
         self._active_drone = drone_id
 
-        # Register in index
         now = time.strftime('%Y-%m-%dT%H:%M:%S')
         if drone_id not in self._index:
             self._index[drone_id] = {'created': now, 'num_updates': 0}
@@ -275,8 +223,6 @@ class DroneAdapterManager:
     def adapter(self) -> Optional[LoRAAdapter]:
         return self._adapter
 
-    # ---- Persistence ----
-
     def save(self, drone_id: str, optimizer=None, replay_buffer=None,
              cusum=None):
         """Save drone adapter state to disk."""
@@ -299,7 +245,6 @@ class DroneAdapterManager:
 
         torch.save(data, self._drone_path(drone_id))
 
-        # Update index
         self._index[drone_id]['last_saved'] = time.strftime('%Y-%m-%dT%H:%M:%S')
         if 'num_updates' in self._index[drone_id]:
             self._index[drone_id]['num_updates'] += 1
@@ -364,17 +309,12 @@ class DroneAdapterManager:
     def num_drones(self) -> int:
         return len(self._index)
 
-    # ---- Trainable params ----
-
     def get_trainable_params(self) -> List[nn.Parameter]:
         if self._adapter is None:
             raise RuntimeError("No adapter active.")
         return self._adapter.get_trainable_params()
 
 
-# ============================================================
-# Smoke Test
-# ============================================================
 if __name__ == '__main__':
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -391,7 +331,7 @@ if __name__ == '__main__':
 
     mgr = DroneAdapterManager(model, checkpoint_dir='test_adapters')
 
-    # Test CRUD
+    # CRUD
     print('\n--- CRUD ---')
     for drone_id in ['drone_A', 'drone_B']:
         is_new = mgr.activate(drone_id)
@@ -409,7 +349,7 @@ if __name__ == '__main__':
     for d in drones:
         print(f'  {d["drone_id"]}: created={d.get("created","?")}, on_disk={d["on_disk"]}, size={d["size_kb"]:.1f}KB')
 
-    # Test replay buffer
+    # Replay buffer
     print('\n--- Replay Buffer ---')
     buf = ReplayBuffer(capacity=20)
     for i in range(25):
@@ -422,12 +362,12 @@ if __name__ == '__main__':
     samples = buf.sample(3)
     print(f'  Sampled {len(samples)} trajectories')
 
-    # Test CUSUM
+    # CUSUM
     print('\n--- CUSUM ---')
     cusum = CUSUMDetector(threshold=3.0)
     triggered = False
     for i in range(100):
-        error = 1.5 if i < 70 else 3.5  # Degradation at step 70
+        error = 1.5 if i < 70 else 3.5
         triggered = cusum.update(error)
         if triggered:
             print(f'  CUSUM triggered at step {i} (error={error})')
@@ -435,7 +375,6 @@ if __name__ == '__main__':
     if not triggered:
         print(f'  CUSUM not triggered (error_history={len(cusum.error_history)})')
 
-    # Cleanup
     import shutil
     shutil.rmtree('test_adapters', ignore_errors=True)
     print('\nAll tests passed!')

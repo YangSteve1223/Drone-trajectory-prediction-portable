@@ -1,17 +1,5 @@
 """
-Online Continual Learner for per-drone LoRA adaptation.
-
-Orchestrates the online learning loop:
-  1. Accumulate confident trajectory observations
-  2. When K observations collected: run gradient update
-  3. Mix in replay buffer samples for catastrophic forgetting protection
-  4. CUSUM escalation when prediction degrades
-  5. Periodic persistence
-
-Usage:
-    learner = OnlineLearner(adapter_manager)
-    learner.observe('drone_001', history, future_gt, confidence=0.85)
-    # ... after K observations, update happens automatically
+Online Continual Learner for per-drone LoRA adaptation with replay buffer and CUSUM escalation.
 """
 
 import torch
@@ -29,10 +17,6 @@ from adapter_manager import (
 from lora import LoRAAdapter
 
 
-# ============================================================
-# Configuration
-# ============================================================
-
 @dataclass
 class OnlineLearnerConfig:
     """Hyperparameters for online continual learning."""
@@ -43,42 +27,32 @@ class OnlineLearnerConfig:
     max_grad_norm: float = 1.0
 
     # Accumulation
-    accumulation_steps: int = 5     # K: trajectories before one update
-    replay_ratio: float = 0.4       # Fraction of batch from replay buffer
+    accumulation_steps: int = 5
+    replay_ratio: float = 0.4
 
     # Regularization
-    lora_l2_penalty: float = 0.01   # Pull LoRA weights toward zero
+    lora_l2_penalty: float = 0.01
 
     # Confidence gating
-    conf_threshold: float = 0.75    # Minimum confidence to accumulate
-    conf_threshold_escalated: float = 0.5  # Lower during CUSUM escalation
-    lr_escalation_factor: float = 3.0      # lr multiplier during escalation
+    conf_threshold: float = 0.75
+    conf_threshold_escalated: float = 0.5
+    lr_escalation_factor: float = 3.0
 
     # CUSUM
     cusum_threshold: float = 3.0
     cusum_drift: float = 1.0
 
     # Persistence
-    save_every: int = 10            # Save adapter every N updates
+    save_every: int = 10
 
     # Device
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-# ============================================================
-# Online Learner
-# ============================================================
-
 class OnlineLearner:
     """
-    Orchestrates per-drone online learning.
-
-    Maintains per-drone:
-      - Optimizer (AdamW)
-      - Accumulation buffer (pending observations)
-      - Replay buffer (past trajectories)
-      - CUSUM detector (degradation monitoring)
-      - Update counter
+    Orchestrates per-drone online learning with optimizer, accumulation buffer,
+    replay buffer, and CUSUM degradation monitoring.
     """
 
     def __init__(self, adapter_manager: DroneAdapterManager,
@@ -87,43 +61,24 @@ class OnlineLearner:
         self.config = config or OnlineLearnerConfig()
         self.device = torch.device(self.config.device)
 
-        # Per-drone state (not persisted to disk — rebuilt on load)
+        # Per-drone state (not persisted to disk, rebuilt on load)
         self._optimizers: Dict[str, optim.AdamW] = {}
-        self._buffers: Dict[str, List[TrajectorySample]] = {}       # accumulation
+        self._buffers: Dict[str, List[TrajectorySample]] = {}
         self._replay: Dict[str, ReplayBuffer] = {}
         self._cusum: Dict[str, CUSUMDetector] = {}
         self._update_counters: Dict[str, int] = {}
         self._escalated: Dict[str, bool] = {}
 
-    # ---- Observe & Update ----
-
     def observe(self, drone_id: str, history: torch.Tensor,
                 future_gt: torch.Tensor, confidence: float = 1.0,
                 intent: int = 0, timestep: int = 0) -> bool:
-        """
-        Record a trajectory observation for a drone.
-        Triggers an update if accumulation buffer reaches K.
-
-        Args:
-            drone_id: Unique drone identifier.
-            history: (20, 6) past trajectory.
-            future_gt: (20, 3) ground truth future displacement.
-            confidence: Model confidence at prediction time [0, 1].
-            intent: Intent label (optional).
-            timestep: Observation timestep (optional).
-
-        Returns:
-            True if an update was performed.
-        """
-        # Check confidence threshold
+        """Record a trajectory observation. Triggers update when buffer reaches K."""
         threshold = self._get_threshold(drone_id)
         if confidence < threshold:
             return False
 
-        # Ensure drone is active and has state
         self._ensure_state(drone_id)
 
-        # Create sample
         sample = TrajectorySample(
             history=history.detach().cpu(),
             future_gt=future_gt.detach().cpu(),
@@ -131,10 +86,8 @@ class OnlineLearner:
             confidence=confidence,
         )
 
-        # Accumulate
         self._buffers[drone_id].append(sample)
 
-        # Check if we should update
         if len(self._buffers[drone_id]) >= self.config.accumulation_steps:
             loss = self._update(drone_id)
             return True
@@ -146,10 +99,8 @@ class OnlineLearner:
             return None
         return self._update(drone_id)
 
-    # ---- Internal: Update Step ----
-
     def _update(self, drone_id: str) -> Optional[float]:
-        """Execute one gradient update step for a drone."""
+        """Execute one gradient update step: build batch, forward, backward, update buffers."""
         cfg = self.config
         buffer = self._buffers[drone_id]
         replay = self._replay[drone_id]
@@ -158,48 +109,44 @@ class OnlineLearner:
         if len(buffer) == 0:
             return None
 
-        # 1. Build batch: K current + M replay samples
+        # Build batch: K current + M replay samples
         k_current = min(len(buffer), cfg.accumulation_steps)
         m_replay = min(int(k_current * cfg.replay_ratio), len(replay))
         current_samples = buffer[:k_current]
         replay_samples = replay.sample(m_replay) if m_replay > 0 else []
 
-        # 2. Activate adapter for this drone and rebind optimizer params
+        # Activate adapter and rebind optimizer params
         was_active = (self.mgr.active_drone == drone_id)
         if not was_active:
             self.mgr.activate(drone_id)
-            # Refresh optimizer param references (params recreated on each activate)
             if drone_id in self._optimizers:
                 trainable = self.mgr.adapter.get_trainable_params()
                 self._optimizers[drone_id].param_groups[0]['params'] = trainable
 
-        # 3. Forward pass
+        # Forward pass
         histories = torch.stack([s.history for s in current_samples + replay_samples])
         futures = torch.stack([s.future_gt for s in current_samples + replay_samples])
 
-        # Get model's device (may differ from learner's config device)
         model_device = next(self.mgr.base_model.parameters()).device
         histories = histories.to(model_device)
         futures = futures.to(model_device)
 
-        self.mgr.adapter.model.eval()  # Keep dropout off during adaptation
+        self.mgr.adapter.model.eval()
 
         out = self.mgr.adapter.model(histories, force_predict=True)
         predictions = out['predictions']
 
-        # 4. Loss
+        # MSE loss + L2 penalty on LoRA params
         mse_loss = F.mse_loss(predictions, futures)
 
-        # L2 penalty on LoRA params
         l2_penalty = torch.tensor(0.0, device=model_device)
         for layer in self.mgr.adapter.lora_layers.values():
             l2_penalty += layer.lora_A.norm() ** 2 + layer.lora_B.norm() ** 2
 
         loss = mse_loss + cfg.lora_l2_penalty * l2_penalty
 
-        # 5. Backward with NaN protection
+        # NaN protection
         if torch.isnan(loss) or torch.isinf(loss):
-            # Reset buffer to avoid repeated NaN
             buffer.clear()
             if not was_active:
                 self.mgr.deactivate()
@@ -218,7 +165,6 @@ class OnlineLearner:
         optimizer.zero_grad()
         loss.backward()
 
-        # Gradient clipping
         trainable = self.mgr.adapter.get_trainable_params()
         torch.nn.utils.clip_grad_norm_(trainable, cfg.max_grad_norm)
 
@@ -238,46 +184,39 @@ class OnlineLearner:
 
         loss_val = loss.item()
 
-        # 6. Update replay buffer with current samples
+        # Update replay buffer with current samples
         for s in current_samples:
             replay.push(s)
 
-        # 7. Clear accumulation buffer
         buffer.clear()
 
-        # 8. Update CUSUM with prediction error
+        # Update CUSUM with prediction error
         with torch.no_grad():
             pred_err = F.mse_loss(predictions[:k_current], futures[:k_current]).item()
         escalated = cusum.update(pred_err)
         self._escalated[drone_id] = escalated
 
-        # 9. Persist periodically (adapter weights only; optimizer rebuilt on load)
+        # Persist periodically
         self._update_counters[drone_id] += 1
         if self._update_counters[drone_id] % cfg.save_every == 0:
             self.mgr.save(drone_id, replay_buffer=replay, cusum=cusum)
 
-        # 10. Restore previous adapter state
         if not was_active:
             self.mgr.deactivate()
 
         return loss_val
 
-    # ---- State Management ----
-
     def _ensure_state(self, drone_id: str):
-        """Initialize per-drone state if first observation."""
+        """Initialize per-drone state on first observation."""
         if drone_id not in self._optimizers:
-            # Activate to create adapter, then deactivate
             self.mgr.activate(drone_id)
 
-            # Create optimizer
             trainable = self.mgr.adapter.get_trainable_params()
             self._optimizers[drone_id] = optim.AdamW(
                 trainable, lr=self.config.lr,
                 weight_decay=self.config.weight_decay,
             )
 
-            # Try to restore saved state (may not exist for new drone)
             has_saved = self.mgr.has_adapter(drone_id)
             if has_saved:
                 try:
@@ -299,7 +238,7 @@ class OnlineLearner:
                     self._update_counters[drone_id] = full_state.metadata.get(
                         'num_updates', 0)
                 except Exception:
-                    has_saved = False  # Fall through to fresh init
+                    has_saved = False
 
             if not has_saved:
                 self._replay[drone_id] = ReplayBuffer(capacity=20)
@@ -308,7 +247,6 @@ class OnlineLearner:
                     drift=self.config.cusum_drift,
                 )
                 self._update_counters[drone_id] = 0
-                # Save initial zero-state to disk so future activates can reload
                 self.mgr.save(drone_id)
 
             self._buffers[drone_id] = []
@@ -317,12 +255,10 @@ class OnlineLearner:
             self.mgr.deactivate()
 
     def _get_threshold(self, drone_id: str) -> float:
-        """Get confidence threshold for a drone (may be escalated)."""
+        """Get confidence threshold (lowered during CUSUM escalation)."""
         if self._escalated.get(drone_id, False):
             return self.config.conf_threshold_escalated
         return self.config.conf_threshold
-
-    # ---- Management ----
 
     def reset_drone(self, drone_id: str):
         """Reset all state for a drone (delete adapter, start fresh)."""
@@ -372,9 +308,6 @@ class OnlineLearner:
         return '\n'.join(lines)
 
 
-# ============================================================
-# Smoke Test
-# ============================================================
 if __name__ == '__main__':
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -390,12 +323,10 @@ if __name__ == '__main__':
         use_trigger=True, trigger_mode='simple',
     ).eval()
 
-    # Use CPU for smoke test (avoids CUDA OOM from training session)
     model = model.cpu()
     mgr = DroneAdapterManager(model, checkpoint_dir='test_adapters_ol')
     learner = OnlineLearner(mgr)
 
-    # Simulate online learning for one drone
     drone = 'test_drone'
     losses = []
 
@@ -414,6 +345,5 @@ if __name__ == '__main__':
     status = learner.get_status(drone)
     print(f'\nFinal: {learner.summary()}')
 
-    # Cleanup
     shutil.rmtree('test_adapters_ol', ignore_errors=True)
     print('\nSmoke test complete!')

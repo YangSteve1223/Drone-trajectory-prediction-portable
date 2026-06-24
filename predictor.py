@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""
-Drone Trajectory Prediction — Portable Predictor
-================================================
-三模型速度自适应软切换推理 + LoRA在线持续学习。
-
-Basic usage:
-    from predictor import DronePredictor
-    p = DronePredictor()
-    result = p.predict(history_tensor)  # (B, 20, 6) in meters, m/s
-
-Online adaptation:
-    p.enable_adaptation()
-    result = p.predict_with_adaptation(history, drone_id='drone_001',
-                                        ground_truth=future_gt)
-"""
+"""三模型速度自适应软切换推理 + LoRA在线持续学习。"""
 
 import torch
 import warnings
@@ -53,25 +39,7 @@ _C4_TO_C6 = {0: 0, 1: 1, 2: 2, 3: 4}
 
 
 class DronePredictor:
-    """
-    无人机轨迹预测器 — 速度自适应三模型软切换。
-
-    Parameters
-    ----------
-    s_low : float
-        低速阈值 (m/s). 低于此速度仅使用低速模型.
-    s_high : float
-        高速阈值 (m/s). 高于此速度仅使用高速模型.
-    device : str or torch.device
-        推理设备 ('cuda' or 'cpu').
-
-    Usage
-    -----
-    >>> p = DronePredictor()
-    >>> hist = torch.randn(4, 20, 6)  # (B, history_len, [x,y,z, vx,vy,vz])
-    >>> out = p.predict(hist)
-    >>> out['predictions'].shape  # (4, 20, 3) — 未来20帧的3D位移(米)
-    """
+    """无人机轨迹预测器 — 速度自适应三模型软切换。"""
 
     def __init__(self, s_low=S_LOW, s_high=S_HIGH, device=None):
         self.s_low = s_low
@@ -132,21 +100,13 @@ class DronePredictor:
 
     @torch.no_grad()
     def predict(self, hist):
-        """
-        预测未来轨迹。
+        """预测未来轨迹。
 
-        Parameters
-        ----------
-        hist : torch.Tensor
-            历史轨迹 (B, 20, 6).
-            维度6: [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z]  (米, 米/秒)
+        Args:
+            hist: (B, 20, 6) [pos_x,pos_y,pos_z, vel_x,vel_y,vel_z] (米, 米/秒)
 
-        Returns
-        -------
-        dict:
-            predictions   : (B, 20, 3)  未来3D位移 (米)
-            intent_logits : (B, 6)      意图分类logits
-            speed         : (B,)        检测到的速度 (m/s)
+        Returns:
+            dict: predictions (B,20,3), intent_logits (B,6), speed (B,)
         """
         # Input validation
         if hist.dim() != 3 or hist.shape[1] != 20 or hist.shape[2] != 6:
@@ -196,17 +156,9 @@ class DronePredictor:
     def reset_stats(self):
         self._stats = {'low': 0, 'mixed': 0, 'high': 0, 'n': 0}
 
-    # ---- Dynamic Normalization (scale-adaptive) ----
-
     def predict_normalized(self, hist, return_norm_params=False):
-        """
-        Predict with per-window dynamic normalization (for FUTURE retrained models).
-
-        Uses DynamicNormalizer to adapt scale, bypassing model's internal norm.
-        Only works well with models trained with dynamic normalization.
-
-        For existing weights, use predict_adaptive() instead.
-        """
+        """Per-window dynamic normalization prediction. For FUTURE retrained models only.
+        For existing weights, use predict_adaptive() instead."""
         from dynamic_norm import DynamicNormalizer, NormConfig
 
         norm = DynamicNormalizer(NormConfig(
@@ -229,23 +181,8 @@ class DronePredictor:
         return result
 
     def predict_adaptive(self, hist, return_scale=False):
-        """
-        Scale-adaptive prediction — works with EXISTING trained weights.
-
-        Instead of bypassing the model's internal /100 normalization,
-        this method scales the input TO the model's training distribution.
-        Small-domain data (UAV-Flow) gets scaled UP, large-domain (NPZDATA)
-        stays near the training range.
-
-        Formula:
-          scale_factor = model_training_scale / current_window_scale
-          input_scaled = input * scale_factor
-          → model processes in its comfortable range
-          → output / scale_factor to get real-world meters
-
-        This preserves prediction quality for existing weights while
-        providing adaptive scaling for visualization.
-        """
+        """Scale-adaptive prediction — works with EXISTING trained weights.
+        Scales input to model's training distribution instead of bypassing internal /100 normalization."""
         from dynamic_norm import DynamicNormalizer, NormConfig
 
         # Compute current window scale (same as predict_normalized)
@@ -290,25 +227,10 @@ class DronePredictor:
             result['current_scale'] = current_scale
         return result
 
-    # ---- Online Continual Learning (LoRA) ----
-
     def enable_adaptation(self, checkpoint_dir: str = 'checkpoints/adapters',
                           lora_r: int = 4, accumulation_steps: int = 5):
-        """
-        Enable per-drone LoRA online adaptation on the mixed model.
-
-        After calling this, use predict_with_adaptation() to perform
-        inference with automatic per-drone fine-tuning.
-
-        Parameters
-        ----------
-        checkpoint_dir : str
-            Directory to store per-drone adapter weights.
-        lora_r : int
-            LoRA rank (default 4, ~11K params per drone).
-        accumulation_steps : int
-            Number of observations before one gradient update.
-        """
+        """Enable per-drone LoRA online adaptation on the mixed model.
+        Use predict_with_adaptation() afterwards for inference with per-drone fine-tuning."""
         from adapter_manager import DroneAdapterManager
         from online_learner import OnlineLearner, OnlineLearnerConfig
 
@@ -327,27 +249,17 @@ class DronePredictor:
                                  ground_truth: torch.Tensor = None,
                                  intent_label: int = 0,
                                  timestep: int = 0) -> dict:
-        """
-        Predict with optional per-drone LoRA adaptation.
+        """Predict with optional per-drone LoRA adaptation.
 
-        Parameters
-        ----------
-        hist : (B, 20, 6) past trajectory in real meters, m/s.
-        drone_id : str or None
-            Unique drone identifier. If None, no adaptation is applied (same as predict()).
-        ground_truth : (B, 20, 3) or None
-            Ground truth future displacement. If provided AND the drone has
-            an active adapter, this observation will be accumulated for online learning.
-        intent_label : int
-            Intent label for this observation (optional).
-        timestep : int
-            Observation timestep (optional).
+        Args:
+            hist: (B, 20, 6) past trajectory in real meters, m/s.
+            drone_id: Unique drone identifier. None = no adaptation (same as predict()).
+            ground_truth: (B, 20, 3) future displacement. If provided, accumulated for online learning.
+            intent_label: Intent label for this observation (optional).
+            timestep: Observation timestep (optional).
 
-        Returns
-        -------
-        Same as predict(), plus:
-            adapted : bool — whether LoRA was applied
-            updated : bool — whether an online update was triggered
+        Returns:
+            Same as predict(), plus adapted (bool), updated (bool).
         """
         # Input validation
         if hist.dim() != 3 or hist.shape[1] != 20 or hist.shape[2] != 6:
@@ -439,9 +351,6 @@ class DronePredictor:
         return getattr(self, '_adaptation_enabled', False)
 
 
-# ============================================================
-# Demo
-# ============================================================
 if __name__ == '__main__':
     import shutil
 
