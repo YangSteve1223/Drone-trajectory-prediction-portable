@@ -196,6 +196,42 @@ class DronePredictor:
     def reset_stats(self):
         self._stats = {'low': 0, 'mixed': 0, 'high': 0, 'n': 0}
 
+    # ---- Dynamic Normalization (scale-adaptive) ----
+
+    def predict_normalized(self, hist, return_norm_params=False):
+        """
+        Predict with per-window dynamic normalization.
+
+        NOTE: Current weights were trained with fixed normalization (_scale_pos=100).
+        Dynamic norm may degrade prediction quality (esp. on NPZDATA high-speed).
+        For production use, train a new model with dynamic norm enabled, or use
+        predict() which matches the training distribution.
+
+        This method is PROVIDED FOR FUTURE USE with dynamically-trained weights.
+        """
+        from dynamic_norm import DynamicNormalizer, NormConfig
+
+        norm = DynamicNormalizer(NormConfig(
+            method="velocity", center_on_first=True, scale_smoothing=0.7,
+        ))
+        hist_norm, norm_params = norm.normalize(hist)
+
+        # Run model with internal normalization bypassed
+        # (each model's forward supports normalize_input=False)
+        for model in [self.low, self.mixed, self.high]:
+            model._norm_input = False
+
+        result = self.predict(hist_norm)
+
+        for model in [self.low, self.mixed, self.high]:
+            model._norm_input = True
+
+        result['predictions'] = norm.denormalize(result['predictions'], norm_params)
+        result['speed'] = self.compute_speed(hist)
+        if return_norm_params:
+            result['norm_params'] = norm_params
+        return result
+
     # ---- Online Continual Learning (LoRA) ----
 
     def enable_adaptation(self, checkpoint_dir: str = 'checkpoints/adapters',

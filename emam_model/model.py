@@ -109,6 +109,9 @@ class TrajectoryPredictor(nn.Module):
         # === 历史意图缓冲区 ===
         self.register_buffer('intent_history', torch.zeros(history_len, num_intent_classes))
 
+        # Internal normalization control (set False for external dynamic norm)
+        self._norm_input = True
+
     def forward(
         self,
         history: torch.Tensor,
@@ -133,13 +136,18 @@ class TrajectoryPredictor(nn.Module):
         B, T, C = history.shape
 
         # === Step 0: 输入归一化 ===
-        # 特征: [x, y, z, vx, vy, vz] — 位置 ~100m, 速度 ~10m/s
-        # 缩放到 ~[0, 5], 所有内部计算在归一化空间进行, 输出再逆归一化
-        _scale_pos = 100.0
-        _scale_vel = 10.0
-        _scale = history.new_tensor([_scale_pos, _scale_pos, _scale_pos,
-                                     _scale_vel, _scale_vel, _scale_vel])
-        h = history / _scale.unsqueeze(0).unsqueeze(0)  # 后续统一用 h
+        if getattr(self, '_norm_input', True):
+            # Fixed global normalization (backward compatible)
+            _scale_pos = 100.0
+            _scale_vel = 10.0
+            _scale = history.new_tensor([_scale_pos, _scale_pos, _scale_pos,
+                                         _scale_vel, _scale_vel, _scale_vel])
+            h = history / _scale.unsqueeze(0).unsqueeze(0)
+        else:
+            # External dynamic normalization active — pass through
+            _scale_pos = 1.0
+            _scale_vel = 1.0
+            h = history
 
         # === Step 1: EMam-SE 编码 ===
         encoded = self.emam_se(h)  # (B, T, d_model)
