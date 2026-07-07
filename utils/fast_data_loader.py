@@ -30,7 +30,7 @@ class FastWindowDataset(Dataset):
     ):
         """
         Args:
-            data_root: NPZDATA 目录路径
+            data_root: SimCruise 目录路径
             split: train/val/test
             label_remap: 标签重映射 dict, 如 {4:3} 将 DESCEND→3 (ASCEND空缺)
         """
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     import time
     from pathlib import Path
 
-    data_root = str(Path(__file__).resolve().parent.parent.parent / "NPZDATA")
+    data_root = str(Path(__file__).resolve().parent.parent.parent / "SimCruise")
 
     for split in ["train", "val"]:
         t0 = time.time()

@@ -24,7 +24,7 @@ result['speed']          # (1,)      速度
 
 ## 核心功能
 
-**三模型速度自适应软切换。** 基于历史轨迹速度在低速(6-class UAV-Flow)、混合(6-class)和高速(4-class NPZDATA)三个模型之间平滑切换。低速场景(0-3 m/s)由低速模型主导，高速场景(8-28 m/s)由高速模型主导，过渡带(2-8 m/s)三角隶属融合。测试集路由准确率100%。
+**三模型速度自适应软切换。** 基于历史轨迹速度在低速(6-class UAV-Flow)、混合(6-class)和高速(4-class SimCruise)三个模型之间平滑切换。低速场景(0-3 m/s)由低速模型主导，高速场景(8-28 m/s)由高速模型主导，过渡带(2-8 m/s)三角隶属融合。测试集路由准确率100%。
 
 **LoRA在线持续学习。** 每台无人机独立微调约11K参数，通过低秩适配矩阵在SSM投影层注入无人机专属偏移量。基础模型权重冻结，仅更新LoRA矩阵和末端输出头。累积5条置信轨迹后触发一次梯度更新，配合Replay Buffer(容量20)防止灾难性遗忘。CUSUM检测器监测预测退化并自动升级学习率。
 
@@ -56,7 +56,7 @@ result['speed']          # (1,)      速度
 ├── weights/                  # 预训练权重 (48MB)
 │   ├── low_speed_6class.pth  # 低速模型 (6-class, UAV-Flow, RMSE=0.56)
 │   ├── mixed_6class.pth      # 混合模型 (6-class, RMSE=0.56)
-│   └── high_speed_4class.pth # 高速模型 (4-class, NPZDATA, RMSE=3.10)
+│   └── high_speed_4class.pth # 高速模型 (4-class, SimCruise, RMSE=3.10)
 ├── checkpoints/              # 训练产出 (双向增强器权重)
 ├── train/                    # 训练脚本和示例数据集
 │   ├── train.py              # 主训练脚本 (含NaN保护、自动回滚)
@@ -121,7 +121,7 @@ python train.py --data_root dataset/uavflow_low --num_intent_classes 6 \
 | 测试集 | 速度范围 | 单模型RMSE(m) | 软切换RMSE(m) | 路由准确率 |
 |--------|---------|:---------:|:---------:|:------:|
 | UAV-Flow | 0-5 m/s | 0.555 | 0.556 | 100% |
-| NPZDATA | 8-28 m/s | 3.10 | 3.10 | 100% |
+| SimCruise | 8-28 m/s | 3.10 | 3.10 | 100% |
 
 ## 引用
 

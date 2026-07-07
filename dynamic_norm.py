@@ -223,8 +223,8 @@ if __name__ == '__main__':
     print(f'  pred_norm range: [{pred_norm.min():.2f}, {pred_norm.max():.2f}]')
     print(f'  pred_real range: [{pred_real.min():.2f}, {pred_real.max():.2f}]')
 
-    # High-speed scenario (NPZDATA, ~20 m/s)
-    print('\n--- High-speed scenario (NPZDATA, ~20 m/s) ---')
+    # High-speed scenario (SimCruise, ~20 m/s)
+    print('\n--- High-speed scenario (SimCruise, ~20 m/s) ---')
     hist_high = torch.randn(2, 20, 6)
     hist_high[:, :, :3] = torch.cumsum(torch.randn(2, 20, 3) * 4.0, dim=1)
     hist_high[:, :, 3:6] = torch.randn(2, 20, 3) * 5.0 + 20.0

@@ -19,8 +19,8 @@ python extract_uavflow.py --output ../UAV-Flow-trajs
 # 2. 生成滑动窗口 (6类意图标注)
 python preprocess_uavflow.py --traj_dir ../UAV-Flow-trajs --out_dir ../UAV-Flow-windows
 
-# 3. (可选) 混入 NPZDATA 仿真数据增强
-python ../align_npzdata.py  # 需要先准备好 NPZDATA
+# 3. (可选) 混入 SimCruise 仿真数据增强
+python ../align_npzdata.py  # 需要先准备好 SimCruise
 ```
 
 ### 方案 B: 自定义数据
@@ -54,10 +54,10 @@ python train.py --data_root ../UAV-Flow-pure --num_intent_classes 6 `
     --loss_intent_weight 0.3 --num_workers 0
 ```
 
-### 纯高速模型 (NPZDATA, 4-class)
+### 纯高速模型 (SimCruise, 4-class)
 
 ```powershell
-python train.py --data_root ../NPZDATA --num_intent_classes 4 `
+python train.py --data_root ../SimCruise --num_intent_classes 4 `
     --d_model 128 --batch_size 128 --epochs 50 --lr 3e-4 `
     --warmup_epochs 5 --trigger_mode simple --exp_name my_high_speed `
     --loss_intent_weight 0.3
@@ -66,7 +66,7 @@ python train.py --data_root ../NPZDATA --num_intent_classes 4 `
 ### 续训已有模型
 
 ```powershell
-python train.py --data_root ../NPZDATA --num_intent_classes 4 `
+python train.py --data_root ../SimCruise --num_intent_classes 4 `
     --d_model 128 --batch_size 128 --epochs 50 `
     --resume ../checkpoints/my_model/latest.pth `
     --trigger_mode simple --exp_name my_high_speed
@@ -90,7 +90,7 @@ python train_bidir.py --epochs 5 --batch_size 128 --data_dir ../UAV-Flow-pure
 | `--pretrained` | 预训练权重路径 | 从已有权重热启动 |
 | `--resume` | 续训检查点路径 | 从中断处继续 |
 | `--no_amp` | 关闭混合精度 | UAV-Flow数据建议开启 |
-| `--num_workers` | 数据加载进程 | 0 (UAV-Flow) / 2-4 (NPZDATA) |
+| `--num_workers` | 数据加载进程 | 0 (UAV-Flow) / 2-4 (SimCruise) |
 
 ## 输出
 

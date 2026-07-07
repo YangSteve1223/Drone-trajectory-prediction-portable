@@ -371,6 +371,199 @@ class NeuralDecoder(nn.Module):
 
 
 # ============================================================================
+# 子模块 5: 多假设神经网络解码器 (Multi-Hypothesis)
+# ============================================================================
+
+class MultiHeadNeuralDecoder(nn.Module):
+    """
+    多假设神经网络解码器：K 个独立预测头 + 置信度评分头。
+
+    每个头独立预测一条轨迹。训练时使用 Winner-Takes-All (WTA) 损失：
+    - 计算 K 条轨迹各自的误差
+    - 选择误差最小的头作为 winner
+    - 仅通过 winner 反向传播
+
+    推理时输出 K 条轨迹 + K 个置信度分数。
+    用 minADE_K / minFDE_K 评估（取 K 条中最接近真值的）。
+    """
+    def __init__(self, d_model: int, trajectory_dim: int = 6, K: int = 5):
+        super().__init__()
+        self.d_model = d_model
+        self.K = K
+
+        # 共享的特征投影
+        self.proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Dropout(0.05),
+        )
+
+        # K 个独立的位移预测头
+        self.delta_heads = nn.ModuleList([
+            nn.Linear(d_model, 3) for _ in range(K)
+        ])
+
+        # K 个独立的不确定性头
+        self.var_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, 32),
+                nn.SiLU(),
+                nn.Dropout(0.05),
+                nn.Linear(32, 3),
+                nn.Softplus(),
+            ) for _ in range(K)
+        ])
+
+        # 置信度评分头: 预测哪个假设最可能正确
+        self.confidence_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.SiLU(),
+            nn.Linear(d_model // 2, K),
+        )
+
+    def forward(
+        self,
+        encoded: torch.Tensor,         # (B, d_model)
+        step_encoding: torch.Tensor,    # (pred_len, d_model)
+        return_all: bool = False,       # if True, return full dict; else return (delta, logvar) tuple
+    ) -> Dict[str, torch.Tensor]:
+        """
+        与 NeuralDecoder 兼容的接口：
+        - return_all=False: 返回 (best_delta, best_logvar) 元组
+        - return_all=True:  返回完整 dict
+
+        Returns (when return_all=True):
+            deltas:      (K, B, pred_len, 3)  K条轨迹位移
+            logvars:     (K, B, pred_len, 3)  每条的不确定性
+            confidences: (B, K)               置信度logits
+            best_delta:  (B, pred_len, 3)     最高置信度的轨迹
+            best_logvar: (B, pred_len, 3)     对应的不确定性
+        """
+        B = encoded.shape[0]
+        P = step_encoding.shape[0]
+
+        # 共享特征投影
+        feat = self.proj(encoded)                           # (B, d_model)
+        feat = feat.unsqueeze(1) + step_encoding.unsqueeze(0)  # (B, pred_len, d_model)
+        feat_flat = feat.reshape(B * P, self.d_model)       # (B*P, d_model)
+
+        # K 个独立预测
+        all_deltas = []
+        all_logvars = []
+        for k in range(self.K):
+            d_flat = self.delta_heads[k](feat_flat)         # (B*P, 3)
+            v_flat = self.var_heads[k](feat_flat)           # (B*P, 3)
+            all_deltas.append(d_flat.reshape(B, P, 3))
+            all_logvars.append(v_flat.reshape(B, P, 3))
+
+        deltas = torch.stack(all_deltas, dim=0)              # (K, B, P, 3)
+        logvars = torch.stack(all_logvars, dim=0)            # (K, B, P, 3)
+
+        # 置信度评分 (基于池化后的特征)
+        pooled_feat = feat.mean(dim=1)                       # (B, d_model)
+        confidences = self.confidence_head(pooled_feat)      # (B, K)
+
+        # 最佳假设 (最高置信度)
+        best_idx = confidences.argmax(dim=1)                 # (B,)
+        best_delta = deltas[best_idx, torch.arange(B, device=encoded.device)]  # (B, P, 3)
+        best_logvar = logvars[best_idx, torch.arange(B, device=encoded.device)]
+
+        if return_all:
+            return {
+                'deltas': deltas,
+                'logvars': logvars,
+                'confidences': confidences,
+                'best_delta': best_delta,
+                'best_logvar': best_logvar,
+            }
+        else:
+            # Backward-compatible: return (delta, logvar) tuple
+            return best_delta, best_logvar
+
+    @staticmethod
+    def compute_wta_loss(
+        deltas: torch.Tensor,           # (K, B, P, 3)
+        logvars: torch.Tensor,          # (K, B, P, 3)
+        confidences: torch.Tensor,      # (B, K)
+        targets: torch.Tensor,          # (B, P, 3)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Winner-Takes-All 损失。
+
+        1. 计算每条轨迹的 L2 误差
+        2. 选择误差最小的作为 winner
+        3. MSE loss 仅通过 winner 反向传播
+        4. 置信度 loss 用交叉熵 (让模型学会预测哪个头最好)
+        """
+        K, B, P, _ = deltas.shape
+        device = deltas.device
+
+        # 每条轨迹的 MSE (B,)
+        errors = []
+        for k in range(K):
+            err = F.mse_loss(deltas[k], targets, reduction='none').mean(dim=(1, 2))  # (B,)
+            errors.append(err)
+        error_matrix = torch.stack(errors, dim=1)  # (B, K)
+
+        # Winner = 最小误差
+        winners = error_matrix.argmin(dim=1)  # (B,)
+
+        # WTA displacement loss: only backprop through winner
+        wta_disp_loss = torch.tensor(0.0, device=device)
+        for k in range(K):
+            mask = (winners == k)
+            if mask.any():
+                wta_disp_loss = wta_disp_loss + F.mse_loss(
+                    deltas[k][mask], targets[mask]
+                ) * mask.float().mean()
+
+        # Confidence loss: cross-entropy, 让模型学会预测 winner
+        conf_loss = F.cross_entropy(confidences, winners)
+
+        return {
+            'wta_disp_loss': wta_disp_loss,
+            'conf_loss': conf_loss,
+            'total_wta_loss': wta_disp_loss + 0.1 * conf_loss,
+            'winners': winners,
+            'min_error': error_matrix.min(dim=1).values.mean(),
+        }
+
+    @staticmethod
+    def compute_minade_fde(
+        deltas: torch.Tensor,           # (K, B, P, 3)
+        targets: torch.Tensor,          # (B, P, 3)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        计算 minADE_K 和 minFDE_K：
+        对每个样本选择 K 条轨迹中误差最小的，计算指标。
+
+        标准的多假设评估指标。
+        """
+        K, B, P, _ = deltas.shape
+
+        # 每条轨迹的 ADE 和 FDE
+        all_ade = []  # K 个 (B,) tensor
+        all_fde = []
+        for k in range(K):
+            step_errs = torch.norm(deltas[k] - targets, dim=-1)  # (B, P)
+            all_ade.append(step_errs.mean(dim=1))                 # (B,)
+            all_fde.append(step_errs[:, -1])                      # (B,)
+
+        ade_matrix = torch.stack(all_ade, dim=1)  # (B, K)
+        fde_matrix = torch.stack(all_fde, dim=1)
+
+        min_ade = ade_matrix.min(dim=1).values     # (B,)
+        min_fde = fde_matrix.min(dim=1).values
+
+        return {
+            'min_ade': min_ade,      # (B,)
+            'min_fde': min_fde,      # (B,)
+            'ade_all': ade_matrix,   # (B, K)
+            'fde_all': fde_matrix,   # (B, K)
+        }
+
+
+# ============================================================================
 # 主模块: UA-PGD
 # ============================================================================
 
@@ -591,6 +784,145 @@ class UncertaintyAwarePGD(nn.Module):
             'physics_trajectory': physics_trajectory,  # (B, pred_len, 3) 物理外推位移
             'neural_delta': neural_delta,        # (B, pred_len, 3) 神经位移增量
         }
+
+    def forward_multi_head(
+        self,
+        encoded_feat: torch.Tensor,       # (B, T, d_model)
+        global_anchor: torch.Tensor,      # (B, 1, d_model)
+        historical_trajectory: torch.Tensor,  # (B, T, 6)
+        intent_weights: Optional[torch.Tensor] = None,  # (B, num_intent_classes)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        多假设前向传播：使用 MultiHeadNeuralDecoder 生成 K 条轨迹。
+
+        共享组件（物理外推、门控、锚点）计算一次，然后与 K 个神经预测分别混合。
+        """
+        B, T, D = encoded_feat.shape
+        P = self.pred_len
+        device = encoded_feat.device
+
+        # ---- 共享组件 (与 forward 相同) ----
+        step_encoding = self.step_encoder().to(device)              # (P, d_model)
+
+        last_encoded = encoded_feat[:, -1, :]                       # (B, d_model)
+        last_encoded = self.feat_compress(last_encoded)             # (B, d_model)
+        last_encoded = self.dropout(last_encoded)
+
+        anchor_pos = self.anchor_to_pos(global_anchor.squeeze(1))  # (B, 3)
+
+        if intent_weights is None:
+            intent_weights = torch.ones(B, self.num_intent_classes, device=device)
+            intent_weights = intent_weights / self.num_intent_classes
+
+        gate_inertia, gate_anchor, gate_confidence, gate_mode, gate_mode_effective = self.physics_gate(
+            last_encoded=last_encoded,
+            intent_weights=intent_weights,
+            step_encoding=step_encoding,
+        )
+
+        physics_trajectory = self.physics_model.multi_step(
+            historical_trajectory, pred_len=P
+        )  # (B, P, 3)
+
+        # 锚点拉回向量
+        last_pos = historical_trajectory[:, -1, :3]                  # (B, 3)
+        last_pos_expanded = last_pos.unsqueeze(1).expand(-1, P, -1)  # (B, P, 3)
+        anchor_pull = (anchor_pos.unsqueeze(1) - last_pos_expanded)  # (B, P, 3)
+        anchor_pull = anchor_pull * gate_anchor.unsqueeze(-1)         # (B, P, 3)
+
+        confidence_factor = gate_confidence.unsqueeze(-1)             # (B, P, 1)
+        gate_mode_exp = gate_mode_effective.unsqueeze(-1)             # (B, P, 1)
+        inertia_effective = gate_inertia.unsqueeze(-1) * (1.0 - 0.3 * gate_mode_exp)
+
+        # ---- 多假设解码 ----
+        if not isinstance(self.neural_decoder, MultiHeadNeuralDecoder):
+            raise RuntimeError(
+                'forward_multi_head requires MultiHeadNeuralDecoder. '
+                'Call replace_with_multi_head() first.'
+            )
+
+        mh_out = self.neural_decoder(
+            encoded=last_encoded,
+            step_encoding=step_encoding,
+            return_all=True,
+        )
+        deltas = mh_out['deltas']      # (K, B, P, 3)
+        logvars = mh_out['logvars']    # (K, B, P, 3)
+        confidences = mh_out['confidences']  # (B, K)
+
+        K = deltas.shape[0]
+
+        # 对每个假设分别混合
+        all_blended = []
+        for k in range(K):
+            neural_delta_k = deltas[k]                                 # (B, P, 3)
+            neural_guided = (neural_delta_k + anchor_pull) * confidence_factor
+
+            blended_k = (
+                inertia_effective * physics_trajectory
+                + (1.0 - inertia_effective) * neural_guided
+            )
+            all_blended.append(blended_k)
+
+        all_blended = torch.stack(all_blended, dim=0)  # (K, B, P, 3)
+        all_logvars = logvars.clamp(-10.0, 10.0)       # (K, B, P, 3)
+
+        # 逆归一化: 与 model.py forward() 中 Step 5 一致
+        _scale_pos = 100.0
+        all_blended = all_blended * _scale_pos
+        physics_trajectory = physics_trajectory * _scale_pos
+
+        # 最佳假设
+        best_idx = confidences.argmax(dim=1)            # (B,)
+        best_pred = all_blended[best_idx, torch.arange(B, device=device)]  # (B, P, 3)
+        best_logvar = all_logvars[best_idx, torch.arange(B, device=device)]
+
+        return {
+            'predictions': best_pred,          # (B, P, 3) 最高置信度轨迹 (meters)
+            'all_predictions': all_blended,    # (K, B, P, 3) K条轨迹 (meters)
+            'all_logvars': all_logvars,        # (K, B, P, 3)
+            'confidences': confidences,        # (B, K)
+            'logvar': best_logvar,             # (B, P, 3)
+            'gate_inertia': gate_inertia,
+            'gate_anchor': gate_anchor,
+            'physics_trajectory': physics_trajectory,
+            'neural_delta': deltas[0] * _scale_pos,  # first head for compatibility
+        }
+
+    def replace_with_multi_head(self, K: int, noise_std: float = 0.02):
+        """替换 NeuralDecoder 为 MultiHeadNeuralDecoder 并初始化权重。"""
+        old_decoder = self.neural_decoder
+        new_decoder = MultiHeadNeuralDecoder(
+            d_model=self.d_model,
+            trajectory_dim=self.traj_dim,
+            K=K,
+        )
+
+        # 复制投影层
+        for p_old, p_new in zip(old_decoder.proj.parameters(), new_decoder.proj.parameters()):
+            if p_old.shape == p_new.shape:
+                p_new.data.copy_(p_old.data)
+
+        # 复制并扰动 K 个头
+        orig_w = old_decoder.delta_head.weight.data.clone()
+        orig_b = old_decoder.delta_head.bias.data.clone()
+        w_std = orig_w.std()
+        b_std = orig_b.std()
+
+        for k in range(K):
+            nw = torch.randn_like(orig_w) * noise_std * w_std
+            nb = torch.randn_like(orig_b) * noise_std * b_std
+            new_decoder.delta_heads[k].weight.data.copy_(orig_w + nw)
+            new_decoder.delta_heads[k].bias.data.copy_(orig_b + nb)
+
+            for p_old, p_new in zip(old_decoder.var_head.parameters(),
+                                      new_decoder.var_heads[k].parameters()):
+                if p_old.shape == p_new.shape:
+                    noise = torch.randn_like(p_old) * noise_std * p_old.std()
+                    p_new.data.copy_(p_old.data + noise)
+
+        self.neural_decoder = new_decoder
+        return new_decoder
 
     def _kinematic_postprocess(
         self,

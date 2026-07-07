@@ -57,7 +57,7 @@ print('\n[3] Real Data Quality (320 samples per dataset)')
 from utils.fast_data_loader import FastWindowDataset
 from utils.metrics import full_evaluation
 
-for ds_name, path in [('UAV-Flow', '../UAV-Flow-pure'), ('NPZDATA', '../NPZDATA')]:
+for ds_name, path in [('UAV-Flow', '../UAV-Flow-pure'), ('SimCruise', '../SimCruise')]:
     ds = FastWindowDataset(path, split='test')
     loader = torch.utils.data.DataLoader(ds, batch_size=64, shuffle=False, num_workers=0)
     preds = []; targets = []

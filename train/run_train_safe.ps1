@@ -12,4 +12,4 @@
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True,garbage_collection_threshold:0.7"
 
 # 续训模式 (从 latest checkpoint 恢复)
-python train.py --data_root ../NPZDATA --num_intent_classes 4 --d_model 128 --batch_size 128 --grad_accum 1 --epochs 50 --lr 3e-4 --loss_intent_weight 0.3 --trigger_mode simple --exp_name emam_4class_d128_safe --checkpoint_dir ./checkpoints --num_workers 2 --resume checkpoints/emam_4class_d128_safe/latest.pth
+python train.py --data_root ../SimCruise --num_intent_classes 4 --d_model 128 --batch_size 128 --grad_accum 1 --epochs 50 --lr 3e-4 --loss_intent_weight 0.3 --trigger_mode simple --exp_name emam_4class_d128_safe --checkpoint_dir ./checkpoints --num_workers 2 --resume checkpoints/emam_4class_d128_safe/latest.pth

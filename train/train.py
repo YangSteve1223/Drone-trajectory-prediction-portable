@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='uav_delivery',
                         choices=['uav_delivery', 'uav_flow_sim'])
     parser.add_argument('--data_root', type=str,
-                        default='./NPZDATA')
+                        default='./SimCruise')
     parser.add_argument('--hist_len', type=int, default=20)
     parser.add_argument('--pred_len', type=int, default=20)
     # 模型
