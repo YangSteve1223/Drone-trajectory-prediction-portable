@@ -1,11 +1,11 @@
-# 无人机轨迹预测 — 可移植工具包
+# EMAM — Drone Trajectory Prediction (Portable)
 
-基于增强状态空间模型(EMAM)的无人机轨迹预测系统，支持多意图识别、速度自适应模型切换、在线持续学习和实时流式推理。
+基于 EMAM (Enhanced Mamba) 架构的无人机轨迹预测系统。双模型速度自适应切换 + 多假设预测 + 在线持续学习。
 
 ## 快速开始
 
 ```bash
-pip install torch numpy tqdm pyyaml
+pip install torch numpy tqdm
 ```
 
 ```python
@@ -17,115 +17,132 @@ predictor = DronePredictor()
 history = torch.randn(1, 20, 6)
 result = predictor.predict(history)
 
-result['predictions']    # (1, 20, 3) 未来位移
-result['intent_logits']  # (1, 6)    意图分类
-result['speed']          # (1,)      速度
+result['predictions']    # (1, 20, 3) 未来位移 (米)
+result['intent_logits']  # (1, 6)    意图分类 logits
+result['speed']          # (1,)      当前速度 (m/s)
+result['route']          # ['LOW'|'HIGH'] 路由选择
 ```
 
-## 核心功能
+## 架构
 
-**三模型速度自适应软切换。** 基于历史轨迹速度在低速(6-class UAV-Flow)、混合(6-class)和高速(4-class SimCruise)三个模型之间平滑切换。低速场景(0-3 m/s)由低速模型主导，高速场景(8-28 m/s)由高速模型主导，过渡带(2-8 m/s)三角隶属融合。测试集路由准确率100%。
+```
+Input (B,20,6) → EMam-SE (SSM编码器) → IA-DTP (意图分类) → UA-PGD (解码器)
+                                                                 ├─ Physics Inertia Gate
+                                                                 ├─ Neural Decoder (1或K个头)
+                                                                 └─ Kinematic Physics Model
+```
 
-**LoRA在线持续学习。** 每台无人机独立微调约11K参数，通过低秩适配矩阵在SSM投影层注入无人机专属偏移量。基础模型权重冻结，仅更新LoRA矩阵和末端输出头。累积5条置信轨迹后触发一次梯度更新，配合Replay Buffer(容量20)防止灾难性遗忘。CUSUM检测器监测预测退化并自动升级学习率。
+### 双模型软融合
 
-**流式实时推理。** 维护20帧滑动窗口，每收到新帧即输出预测。适合机载边缘部署，逐帧处理延迟约46ms/batch(RTX 3060)。
+| 模型 | 数据集 | 类别 | 频率 | 速度域 |
+|:--|:--|:--|:--|:--|
+| LOW | UAV-Flow (真实DJI) | 6-class | 5Hz | 0–3 m/s |
+| HIGH | SimCruise (仿真巡航) | 4-class | 1Hz | 8–28 m/s |
 
-**空间自适应缩放。** 基于窗口平均速度动态计算归一化尺度，替代模型内部硬编码的固定常数(`_scale_pos=100`)。提供`predict_adaptive()`兼容现有权重，以及`predict_normalized()`供动态归一化重新训练的模型使用。
+- **软融合**: `α = sigmoid((speed - 5.0) / 1.2)`, 过渡区 [2, 8] m/s 内平滑混合
+- 过渡区外硬分配，避免跨域污染
+- 意图 logits 同步软融合
 
-**安全与风险评估。** 支持圆柱、长方体和球形禁飞区边界定义，计算预测轨迹到边界的最小距离和侵入时间。异常检测器基于预测误差的自适应阈值(mu+k*sigma)和CUSUM累积和检测持续退化。
+### 多假设预测 (Multi-Hypothesis)
+
+K=5 个独立预测头 + 置信度评分头，Winner-Takes-All 训练：
+
+```python
+# 训练多假设解码器
+python train_multi_head.py --model high --K 5 --epochs 10 --batch_size 64
+
+# 推理时取 K 条轨迹中置信度最高的，或用 minFDE_K 评估
+```
+
+### Z轴三段式纠正
+
+基于 DESCEND 概率的三段式过渡 + 多信号融合：
+- 信号1: Z历史趋势 (下降倾向检测)
+- 信号2: 模型Z轴不确定性 (低方差 → 减弱压制)
+- 信号3: 预测Z位移量级 (大位移 → 减弱压制)
 
 ## 目录结构
 
 ```
-├── predictor.py              # DronePredictor — 推理和在线学习入口
-├── streaming.py              # StreamingPredictor — 逐帧流式推理
-├── bidirectional.py          # BidirectionalPredictor — 双向SSM增强
-├── lora.py                   # LoRALinear, LoRAAdapter — 低秩适配
-├── adapter_manager.py        # DroneAdapterManager — 多机适配器管理
-├── online_learner.py         # OnlineLearner — 累积更新引擎
-├── safety.py                 # RiskAssessment, AnomalyDetector
-├── dynamic_norm.py           # DynamicNormalizer, SI-MSE loss
-├── emam_model/               # EMAM模型架构
-│   ├── model.py              # TrajectoryPredictor (EMam-SE + IA-DTP + UA-PGD)
-│   ├── emam_se.py            # Enhanced Mamba with Squeeze-and-Excitation
-│   ├── bidirectional_mamba.py  # BidirectionalSelectiveSSM
-│   ├── ia_dtp.py             # Intent-Aware Dynamic Temporal Pyramid
-│   ├── ua_pgd.py             # Uncertainty-Aware Physics-Guided Decoder
-│   └── trigger.py            # SimpleTrigger / FunnelTrigger / EventDrivenTrigger
-├── utils/                    # 数据加载和评估指标
-├── weights/                  # 预训练权重 (48MB)
-│   ├── low_speed_6class.pth  # 低速模型 (6-class, UAV-Flow, RMSE=0.56)
-│   ├── mixed_6class.pth      # 混合模型 (6-class, RMSE=0.56)
-│   └── high_speed_4class.pth # 高速模型 (4-class, SimCruise, RMSE=3.10)
-├── checkpoints/              # 训练产出 (双向增强器权重)
-├── train/                    # 训练脚本和示例数据集
-│   ├── train.py              # 主训练脚本 (含NaN保护、自动回滚)
-│   ├── train_bidir.py        # 双向增强器训练
-│   ├── dataset/              # 预处理数据集 (295MB)
-│   └── README.md             # 训练文档
+├── predictor.py              # DronePredictor — 推理入口 (软融合+Z纠正)
+├── emam_model/               # EMAM 模型架构
+│   ├── model.py              # TrajectoryPredictor
+│   ├── emam_se.py            # Enhanced Mamba with SE
+│   ├── ia_dtp.py             # Intent-Aware DTP
+│   ├── ua_pgd.py             # UA-PGD + MultiHeadNeuralDecoder
+│   └── trigger.py            # 事件触发器
+├── utils/                    # 数据加载 & 评估指标
+│   ├── fast_data_loader.py   # FastWindowDataset
+│   └── metrics.py            # ADE/FDE/MMD 指标
+├── weights/                  # 预训练权重 (~48MB)
+│   ├── low_speed_6class.pth  # LOW 模型
+│   └── high_speed_4class.pth # HIGH 模型
+├── train_multi_head.py       # 多假设解码器训练 (WTA loss)
+├── evaluate.py               # 综合评估 (ADE/FDE/意图/不确定性)
+├── diagnose_failures.py      # 最差样本深度诊断
+├── visualize_final.py        # 8 张科研图表
+├── run_all.py                # 6 张基础轨迹图
+├── rollout.py                # 自回归预测外推
+├── fix_labels.py             # UAV-Flow 标签修正
+├── context_adapter.py        # ContextAdapterV2 (上下文注入解码器)
+├── context_sim.py            # 仿真数据 Adapter 训练
+├── pic-results/              # 所有评估图表 + README.md
 └── README.md
 ```
 
-## 三模型软切换架构
+## 性能指标 (2026-07-07)
 
-速度(m/s): 0 — 2.0 — 8.0 — 28+
-低速模型(6-class): DJI无人机, 慢速高机动, RMSE=0.56
-混合模型(6-class): 过渡桥接, RMSE=0.56
-高速模型(4-class): 物流无人机, 快速低机动, RMSE=3.10
+### 单模型 (确定性预测)
 
-## 在线学习使用
+| 指标 | LOW (UAV-Flow) | HIGH (SimCruise) |
+|:--|:--:|:--:|
+| ADE mean / median | 0.61m / 0.50m | 1.71m / 0.75m |
+| FDE mean / median | 1.38m / 1.15m | 5.46m / 1.42m |
+| FDE P95 | 3.45m | 36.97m |
+| 方向误差 | 23° | 0.1° |
+| 灾难性失败 (>90°) | 0.52% | 0% |
+| 最佳意图 | HOVER 0.19m | STRAIGHT 1.42m |
+| 最差意图 | TURN_R 1.55m | **DESCEND 27.26m** |
 
-```python
-predictor.enable_adaptation()
+### 多假设预测 (K=5, 3轮快速训练)
 
-for t, (hist, gt) in enumerate(data_stream):
-    out = predictor.predict_with_adaptation(
-        hist, drone_id='drone_001',
-        ground_truth=gt, timestep=t,
-    )
-```
+| 指标 | 单模型 | minFDE_5 | 改善 |
+|:--|:--:|:--:|:--:|
+| 整体 minADE_5 | 1.71m | **0.87m** | **+49%** |
+| 整体 minFDE_5 | 5.46m | **1.87m** | **+66%** |
+| STRAIGHT | 1.42m | 0.99m | -55% |
+| **DESCEND** | **27.26m** | **7.04m** | **-69%** |
+| TURN_L | 4.24m | 3.53m | -25% |
+| TURN_R | 3.65m | 3.85m | -3% |
 
-## 流式推理使用
+> **关键突破**: DESCEND 贡献 HIGH 模型 76% 的总误差（仅 15% 样本）。多假设预测让模型不需要"猜对"下降，只需要"覆盖到"——5 条轨迹中至少一条命中下降路径。
 
-```python
-from streaming import StreamingPredictor
+## 脚本速查
 
-sp = StreamingPredictor(predictor)
-for frame in sensor_stream:
-    result = sp.update(frame)      # 缓冲满20帧后开始输出
-    if result:
-        future = result['predictions']
-```
-
-## 训练
-
-训练脚本和预处理数据集位于`train/`目录。详见`train/README.md`。
-
-```bash
-cd train
-python train.py --data_root dataset/uavflow_low --num_intent_classes 6 \
-    --d_model 128 --batch_size 128 --epochs 30 --lr 1e-4 \
-    --trigger_mode simple --exp_name my_model
-```
+| 脚本 | 用途 | 命令示例 |
+|:--|:--|:--|
+| `predictor.py` | 推理入口 | `from predictor import DronePredictor` |
+| `evaluate.py` | 综合评估 | `python evaluate.py` |
+| `train_multi_head.py` | 多假设训练 | `python train_multi_head.py --model high --K 5` |
+| `diagnose_failures.py` | 最差样本诊断 | `python diagnose_failures.py` |
+| `visualize_final.py` | 科研图表 | `python visualize_final.py` |
+| `run_all.py` | 轨迹可视化 | `python run_all.py` |
+| `rollout.py` | 预测外推 | `python rollout.py` |
+| `fix_labels.py` | 标签修正 | `python fix_labels.py` |
 
 ## 模型规格
 
-- 架构: EMAM-SE + IA-DTP + UA-PGD
-- 参数量: ~1.4M / 模型 (d_model=128)
-- 输入: 20帧 (5Hz = 4秒历史) x 6维 [pos, vel]
-- 输出: 20帧 (4秒预测) x 3维位移
-- 依赖: Python >= 3.8, PyTorch >= 2.0, numpy
+- 参数量: ~1.4M / 模型 (d_model=128, d_state=16)
+- 多假设头: +48K 可训练参数 (K=5, 占总参数 3.5%)
+- 输入: 20 帧 × 6 维 [pos, vel] (LOW 4s@5Hz, HIGH 20s@1Hz)
+- 输出: 20 帧 × 3 维位移 (或 K×20×3 多假设)
+- 硬件: RTX 3060 Laptop (6GB), Windows 11, Python 3.10
 
-## 评估结果
+## 已知问题
 
-| 测试集 | 速度范围 | 单模型RMSE(m) | 软切换RMSE(m) | 路由准确率 |
-|--------|---------|:---------:|:---------:|:------:|
-| UAV-Flow | 0-5 m/s | 0.555 | 0.556 | 100% |
-| SimCruise | 8-28 m/s | 3.10 | 3.10 | 100% |
-
-## 引用
-
-本项目基于EMAM (Enhanced Mamba)架构实现。如使用本工作，请引用原论文。
+- **HIGH DESCEND**: 历史窗口内 Z 坐标恒定（仿真巡航），模型需从非 Z 特征推断即将下降。多假设已大幅改善（-69%），但无法完全消除不确定性
+- **LOW 极端转弯** (>150°): 模型可能预测 STRAIGHT 而非转弯（标签修正已改善）
+- **物理模型过于简单**: 2 帧速度估算，不足以支撑复杂机动
 
 ## 许可
 
