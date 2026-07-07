@@ -1,0 +1,63 @@
+{
+  "model": "HIGH (SimCruise)",
+  "K": 5,
+  "test_samples": 150000,
+  "single": {
+    "ade_mean": 1.7067290328137577,
+    "ade_median": 0.7526663839817047,
+    "ade_p95": 8.777517557144126,
+    "fde_mean": 5.454958861663565,
+    "fde_median": 1.4185575246810913,
+    "fde_p95": 36.96742115020747,
+    "per_intent": {
+      "STRAIGHT": {
+        "fde_mean": 1.4171001750708674,
+        "count": 121056
+      },
+      "TURN_L": {
+        "fde_mean": 4.236865939296988,
+        "count": 3009
+      },
+      "TURN_R": {
+        "fde_mean": 3.645117072622791,
+        "count": 3093
+      },
+      "DESCEND": {
+        "fde_mean": 27.25997170734563,
+        "count": 22842
+      }
+    }
+  },
+  "multi_k5": {
+    "min_ade_mean": 0.9296237606026729,
+    "min_ade_median": 0.6551516950130463,
+    "min_ade_p95": 2.6397726416587743,
+    "min_fde_mean": 1.8355614425144406,
+    "min_fde_median": 0.9490083456039429,
+    "min_fde_p95": 6.820935630798339,
+    "single_best_fde_mean": 5.347668851561403,
+    "per_intent": {
+      "STRAIGHT": {
+        "min_fde_mean": 0.9592522971584553,
+        "count": 121056
+      },
+      "TURN_L": {
+        "min_fde_mean": 3.015844411100609,
+        "count": 3009
+      },
+      "TURN_R": {
+        "min_fde_mean": 3.255316601759633,
+        "count": 3093
+      },
+      "DESCEND": {
+        "min_fde_mean": 6.13201997242395,
+        "count": 22842
+      }
+    }
+  },
+  "improvement": {
+    "ade_pct": 45.53184818857442,
+    "fde_pct": 66.3505905532226,
+    "descend_fde_pct": 77.50540595472599
+  }
+}
