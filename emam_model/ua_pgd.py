@@ -1,23 +1,4 @@
-"""
-Uncertainty-Aware Physics-Guided Decoder (UA-PGD)
-=================================================
-
-核心四机制：
-  1. 正交步长编码 (Orthogonal Step Encoding)
-  2. 不确定性自适应全局锚定 (Uncertainty Adaptive Global Anchoring)
-  3. 物理惯性门控 (Physical Inertia Gating)
-  4. 运动学解耦反馈 (Kinematic Decoupling Feedback)
-
-输入:
-    encoded_feat: (B, T, d_model)       EMam-SE 编码特征
-    global_anchor: (B, 1, d_model)    IA-DTP 生成的全局目标锚点
-    historical_trajectory: (B, T, 6)    [x, y, z, vx, vy, vz]
-
-输出:
-    predictions: (B, pred_len, 3)      未来3D位移预测
-    logvar: (B, pred_len, 3)           对数方差（不确定性）
-    (可选) intermediate_gates: 门控状态序列（用于意图读出）
-"""
+"""Uncertainty-Aware Physics-Guided Decoder with inertia gate, anchor pull, and kinematic model."""
 
 import math
 import torch
@@ -27,73 +8,67 @@ from typing import Dict, Optional, Tuple
 
 
 # ============================================================================
-# 子模块 1: 正交步长编码器
+# Submodule 1: Orthogonal Step Encoder
 # ============================================================================
 
 class OrthogonalStepEncoder(nn.Module):
-    """
-    正交步长编码 (Orthogonal Step Encoding)
+    """Orthogonal step encoding: generates a distinct representation per prediction step.
 
-    为每个预测步生成正交的步长表征，使得：
-      - 相邻步之间的表征区分度高
-      - 远期步的编码不受近期步编码的干扰
-      - 网络能够区分"预测第1步"和"预测第10步"的状态
-
-    实现：多频率正弦-余弦对偶编码，频率指数增长。
-    理论上任意两个不同步的编码内积趋近于0（正交性）。
+    Uses multi-frequency sine-cosine pairs with exponentially growing frequencies so
+    that encodings of different steps are approximately orthogonal.
     """
     def __init__(self, pred_len: int, d_model: int):
         super().__init__()
         self.pred_len = pred_len
         self.d_model = d_model
 
-        # 生成固定的正交基（不可学习），避免过拟合
+        # Fixed (non-learnable) orthogonal basis to avoid overfitting
         steps = torch.arange(1, pred_len + 1).float()           # [1, ..., pred_len]
-        # 频率从 1 指数增长到 ~148，保证高频分量用于区分长步
+        # Frequencies grow exponentially from 1 to ~148; high frequencies distinguish far steps
         freqs = torch.exp(torch.linspace(0, math.log(150), d_model // 2))
 
         pe = torch.zeros(pred_len, d_model)
-        pe[:, 0::2] = torch.sin(steps.unsqueeze(1) * freqs)    # 偶数维：sin
-        pe[:, 1::2] = torch.cos(steps.unsqueeze(1) * freqs)   # 奇数维：cos
+        pe[:, 0::2] = torch.sin(steps.unsqueeze(1) * freqs)    # even dims: sin
+        pe[:, 1::2] = torch.cos(steps.unsqueeze(1) * freqs)   # odd dims: cos
         self.register_buffer('_pe', pe)                         # (pred_len, d_model)
 
-        # 可学习的缩放因子，让模型自适应调整编码幅度
+        # Learnable scaling factor so the model can adapt the encoding amplitude
         self.step_scale = nn.Parameter(torch.ones(1))
 
     def forward(self) -> torch.Tensor:
         """
         Returns:
-            step_encoding: (pred_len, d_model)  正交步长编码
+            step_encoding: (pred_len, d_model)  orthogonal step encoding
         """
         return self.step_scale * self._pe
 
 
 # ============================================================================
-# 子模块 2: 物理惯性门控 (核心机制)
+# Submodule 2: Physics Inertia Gate (core mechanism)
 # ============================================================================
 
 class PhysicsInertiaGate(nn.Module):
     """
-    物理惯性门控 (Physical Inertia Gating)
+    Physical Inertia Gating.
 
-    核心思想：预测步的输出 = 物理模型外推 × 惯性门控 + 神经网络预测 × (1 - 惯性门控)
-    同时叠加全局锚点的拉回效应。
+    Core idea: step output = physics extrapolation x inertia gate + neural prediction x (1 - inertia gate),
+    with an added anchor pull-back effect.
 
-    四个门控:
-        gate_inertia:    历史惯性保留比例 (0~1)
-                         - 机动时上升：跟随突发动作
-                         - 巡航/悬停时下降：依赖模型预测
-        gate_anchor:     锚点拉回强度 (0~1)
-                         - 步越远越强，防止长期预测发散
-        gate_confidence: 模型置信度 (0~1)，从不确定性映射
-                         - 高不确定性时，降低神经网络权重
-        gate_mode:       飞行模式调制 (0~1)，从意图权重映射
-                         - 悬停时强制锚点拉回增强
+    Four gates:
+        gate_inertia:    ratio of historical inertia to keep (0~1)
+                         - rises during maneuvers: follow abrupt actions
+                         - falls during cruise/hover: rely on model prediction
+        gate_anchor:     anchor pull-back strength (0~1)
+                         - stronger for farther steps, prevents long-horizon divergence
+        gate_confidence: model confidence (0~1), mapped from uncertainty
+                         - reduces neural weight under high uncertainty
+        gate_mode:       flight-mode modulation (0~1), mapped from intent weights
+                         - forces stronger anchor pull-back when hovering
 
-    输入: 最后时刻编码特征 (B, d_model)
-          意图权重 (B, num_intent_classes)
-          步长编码 (pred_len, d_model)
-    输出: 门控参数序列 (B, pred_len, num_gates)
+    Inputs: last-step encoded feature (B, d_model)
+            intent weights (B, num_intent_classes)
+            step encoding (pred_len, d_model)
+    Output: gate parameter sequence (B, pred_len, num_gates)
     """
     def __init__(self, d_model: int, num_intent_classes: int, pred_len: int):
         super().__init__()
@@ -101,17 +76,17 @@ class PhysicsInertiaGate(nn.Module):
         self.num_intent_classes = num_intent_classes
         self.num_gates = 4  # inertia, anchor, confidence, mode
 
-        # 从编码特征预测基础门控 (gate_inertia, gate_anchor)
+        # Predict base gates from encoded feature (gate_inertia, gate_anchor)
         hidden = d_model // 2
         self.gate_mlp = nn.Sequential(
             nn.Linear(d_model, hidden),
             nn.SiLU(),
             nn.Linear(hidden, 2),        # gate_inertia, gate_anchor
-            nn.Sigmoid()                  # 约束到 (0,1)
+            nn.Sigmoid()                  # constrain to (0,1)
         )
 
-        # 从意图权重预测模式门控（逐类别）
-        # gate_mode: (B, num_intent_classes) 每种意图对应一个模式值
+        # Predict mode gate from intent weights (per class)
+        # gate_mode: (B, num_intent_classes) one mode value per intent
         self.intent_to_mode = nn.Sequential(
             nn.Linear(num_intent_classes, 64),
             nn.SiLU(),
@@ -120,20 +95,20 @@ class PhysicsInertiaGate(nn.Module):
             nn.Sigmoid()
         )
 
-        # 正交步长编码投影（用于计算步相关锚点权重）
+        # Orthogonal step-encoding projection (for step-dependent anchor weights)
         self.step_proj = nn.Linear(d_model, 1, bias=False)
 
-        # 门控温度参数（避免门控过于 binary）
+        # Gate temperature parameter (avoids overly binary gates)
         self.temperature = nn.Parameter(torch.tensor(1.0))
 
-        # 初始化：默认以物理惯性为主，锚点拉回适中
+        # Init: default to physics inertia dominance, moderate anchor pull-back
         self._init_weights()
 
     def _init_weights(self):
         nn.init.xavier_uniform_(self.gate_mlp[0].weight)
         nn.init.zeros_(self.gate_mlp[0].bias)
         nn.init.xavier_uniform_(self.gate_mlp[2].weight)
-        # 初始化 gate_inertia 偏高 (~0.6)，gate_anchor 适中 (~0.3)
+        # Init gate_inertia high (~0.6), gate_anchor moderate (~0.3)
         with torch.no_grad():
             self.gate_mlp[2].bias.copy_(torch.tensor([0.6, 0.3]))
 
@@ -145,80 +120,80 @@ class PhysicsInertiaGate(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
-            gate_inertia:      (B, pred_len)    惯性保留比例
-            gate_anchor:       (B, pred_len)    锚点拉回强度
-            gate_confidence:   (B, pred_len)    置信度（暂无不确定性输入，设为1）
-            gate_mode:         (B, num_intent_classes)  逐类别模式强度
-            gate_mode_effective: (B, pred_len)  加权映射后的步级模式强度
+            gate_inertia:      (B, pred_len)    inertia retention ratio
+            gate_anchor:       (B, pred_len)    anchor pull-back strength
+            gate_confidence:   (B, pred_len)    confidence (no uncertainty input yet, set to 1)
+            gate_mode:         (B, num_intent_classes)  per-class mode strength
+            gate_mode_effective: (B, pred_len)  weighted per-step mode strength
         """
         B = last_encoded.shape[0]
         P = step_encoding.shape[0]          # pred_len
 
-        # --- 1. 基础门控 (从编码特征预测) ---
+        # --- 1. Base gates (predicted from encoded feature) ---
         base_gates = self.gate_mlp(last_encoded)          # (B, 2)
         gate_inertia_base = base_gates[:, 0]               # (B,)
         gate_anchor_base = base_gates[:, 1]                # (B,)
 
-        # --- 2. 步长依赖的锚点权重 (步越远锚点越强) ---
+        # --- 2. Step-dependent anchor weights (farther step, stronger anchor) ---
         # step_encoding: (pred_len, d_model)
         step_weights_raw = self.step_proj(step_encoding).squeeze(-1)   # (pred_len,)
         step_weights = torch.sigmoid(step_weights_raw)                # (pred_len,)
-        # 步权重从 ~0.2 逐渐增加到 ~0.8
+        # Step weights grow gradually from ~0.2 to ~0.8
         step_weights = 0.2 + 0.6 * step_weights
 
-        # gate_anchor 随步长增长
+        # gate_anchor grows with step
         gate_anchor = gate_anchor_base.unsqueeze(1) * step_weights.unsqueeze(0)  # (B, pred_len)
         gate_anchor = gate_anchor.clamp(0.0, 1.0)
 
-        # --- 3. 惯性门控：步长增加时下降（远期预测更依赖模型） ---
-        # gate_inertia 反比于步长
-        inertia_step_decay = torch.linspace(1.0, 0.4, P, device=last_encoded.device)  # 早期1.0 → 远期0.4
+        # --- 3. Inertia gate: decreases with step (far-horizon prediction relies more on model) ---
+        # gate_inertia is inversely proportional to step
+        inertia_step_decay = torch.linspace(1.0, 0.4, P, device=last_encoded.device)  # early 1.0 -> far 0.4
         gate_inertia = gate_inertia_base.unsqueeze(1) * inertia_step_decay.unsqueeze(0)  # (B, pred_len)
         gate_inertia = gate_inertia.clamp(0.0, 1.0)
 
-        # --- 4. 模式门控 (逐意图类别预测) ---
-        # intent_to_mode 输出 (B, num_intent_classes)，与 intent_weights 形状相同
-        # gate_mode 范围 [0,1]，高值表示该意图对应的锚点拉回增强
+        # --- 4. Mode gate (predicted per intent class) ---
+        # intent_to_mode outputs (B, num_intent_classes), same shape as intent_weights
+        # gate_mode in [0,1]; high value means anchor pull-back is enhanced for that intent
         gate_mode = self.intent_to_mode(intent_weights)   # (B, num_intent_classes)
 
-        # 将逐意图类别的 gate_mode 映射为预测步长的加权平均
+        # Map per-class gate_mode to a weighted average over prediction steps
         # gate_mode_effective[b, p] = sum_c(gate_mode[b,c] * intent_weights[b,c])
-        # 物理含义：在当前意图分布下，锚点拉回的整体强度
+        # Physical meaning: overall anchor pull-back strength under the current intent distribution
         gate_mode_per_step = gate_mode * intent_weights          # (B, num_intent_classes)
         gate_mode_effective = gate_mode_per_step.sum(dim=1, keepdim=True)  # (B, 1)
         gate_mode_effective = gate_mode_effective.expand(-1, P)  # (B, P)
 
-        # gate_confidence：暂无不确定性输入，默认全 1（后续可从外部输入的不确定性特征接入）
+        # gate_confidence: no uncertainty input yet, default all ones (can later accept an external uncertainty feature)
         gate_confidence = torch.ones(B, P, device=last_encoded.device)
 
         return gate_inertia, gate_anchor, gate_confidence, gate_mode, gate_mode_effective
 
 
 # ============================================================================
-# 子模块 3: 运动学物理模型
+# Submodule 3: Kinematic Physics Model
 # ============================================================================
 
 class KinematicPhysicsModel(nn.Module):
     """
-    运动学解耦物理模型 (Kinematic Physics Model)
+    Kinematic Physics Model with decoupled degrees of freedom.
 
-    对 位置/速度/加速度 三自由度独立建模，保证物理一致性：
+    Models position/velocity/acceleration independently for physical consistency:
 
-    位置外推: p_{t+dt} = p_t + v_t * dt + 0.5 * a_t * dt^2
-    速度外推: v_{t+dt} = v_t + a_t * dt
-    加速度上界: |a| <= max_acc (无人机典型值: 15 m/s²)
+    Position extrapolation: p_{t+dt} = p_t + v_t * dt + 0.5 * a_t * dt^2
+    Velocity extrapolation: v_{t+dt} = v_t + a_t * dt
+    Acceleration bound: |a| <= max_acc (typical drone value: 15 m/s^2)
 
-    仅作为强归纳偏置，在惯性门控开启时混合使用，不强制约束。
+    Serves only as a strong inductive bias, blended in when the inertia gate is open; not a hard constraint.
     """
     def __init__(self, trajectory_dim: int = 6, max_accel: float = 15.0):
         super().__init__()
         self.traj_dim = trajectory_dim          # 6: [x,y,z,vx,vy,vz]
         self.max_accel = max_accel
-        self.pos_dim = 3                         # 位置维度: [x,y,z]
+        self.pos_dim = 3                         # position dims: [x,y,z]
 
-        # 加速度估算 MLP：从状态预测加速度修正量
-        # 输入: 位置(3) + 速度(3)
-        # 输出: 加速度修正(3)
+        # Acceleration estimation MLP: predicts an acceleration correction from state
+        # Input: position(3) + velocity(3)
+        # Output: acceleration correction(3)
         self.acc_net = nn.Sequential(
             nn.Linear(6, 32),
             nn.SiLU(),
@@ -228,31 +203,31 @@ class KinematicPhysicsModel(nn.Module):
 
     def forward(self, trajectory: torch.Tensor) -> torch.Tensor:
         """
-        基于运动学方程外推一步位移（相对位移）。
+        Extrapolate one displacement step (relative displacement) via kinematic equations.
 
         Args:
             trajectory: (B, T, 6)  [x, y, z, vx, vy, vz]
         Returns:
-            physics_delta: (B, 3)  相对位移增量（与neural_delta量纲一致）
+            physics_delta: (B, 3)  relative displacement increment (same units as neural_delta)
         """
         dt = 0.1
 
-        # 取最后时刻和倒数第二时刻
+        # Take the last and second-to-last time steps
         last = trajectory[:, -1, :]   # (B, 6)
         prev = trajectory[:, -2, :]  # (B, 6)
 
-        # 基准位置（绝对）
+        # Reference position (absolute)
         base_pos = last[:, :3]       # (B, 3)
-        # 速度（差分估算）
+        # Velocity (finite-difference estimate)
         vel = (last[:, :3] - prev[:, :3]) / dt
         vel = torch.clamp(vel, -50, 50)
 
-        # 加速度网络估算
+        # Acceleration network estimate
         state_input = torch.cat([base_pos, vel], dim=-1)
         acc_pred = self.acc_net(state_input)       # (B, 3)
         acc_pred = torch.clamp(acc_pred, -self.max_accel, self.max_accel)
 
-        # 相对位移：p_{t+1} = p_t + v_t*dt + 0.5*a_t*dt^2
+        # Relative displacement: p_{t+1} = p_t + v_t*dt + 0.5*a_t*dt^2
         physics_delta = vel * dt + 0.5 * acc_pred * (dt ** 2)  # (B, 3)
 
         return physics_delta
@@ -263,102 +238,103 @@ class KinematicPhysicsModel(nn.Module):
         pred_len: int
     ) -> torch.Tensor:
         """
-        多步物理外推（不使用神经网络，纯运动学方程）。
+        Multi-step physics extrapolation (no neural network, pure kinematic equations).
 
-        输出相对位移：从历史最后位置开始的外推位移增量序列。
-        输出形状：(B, pred_len, 3)，与 neural_delta 对齐（量纲一致）。
+        Outputs relative displacement: the sequence of displacement increments extrapolated
+        from the last historical position.
+        Output shape: (B, pred_len, 3), aligned with neural_delta (same units).
 
         Args:
-            trajectory: (B, T, 6)  历史轨迹 [x,y,z,vx,vy,vz]
-            pred_len: 预测步数
+            trajectory: (B, T, 6)  historical trajectory [x,y,z,vx,vy,vz]
+            pred_len: number of prediction steps
         Returns:
-            physics_trajectory: (B, pred_len, 3)  相对位移序列
+            physics_trajectory: (B, pred_len, 3)  relative displacement sequence
         """
         B = trajectory.shape[0]
         dt = 0.1
 
-        # 基准位置：历史最后时刻的位置（绝对坐标）
+        # Reference position: position at the last historical step (absolute coordinates)
         base_pos = trajectory[:, -1, :3].clone()  # (B, 3)
 
-        # 初始速度：从最近两帧差分估算
+        # Initial velocity: finite difference from the last two frames
         vel = (trajectory[:, -1, :3] - trajectory[:, -2, :3]) / dt
         vel = torch.clamp(vel, -50, 50)
 
-        # 位置累积（从基准位置出发，累计位移）
+        # Position accumulation (start from reference position, accumulate displacement)
         pos_delta = torch.zeros(B, 3, device=trajectory.device)
         physics_preds = []
 
-        # 加速度状态（用于指数平滑）
+        # Acceleration state (for exponential smoothing)
         acc_state = torch.zeros_like(vel)
 
         for step in range(pred_len):
-            # 加速度网络估算
-            state_input = torch.cat([base_pos + pos_delta, vel], dim=-1)  # 用绝对位置
+            # Acceleration network estimate
+            state_input = torch.cat([base_pos + pos_delta, vel], dim=-1)  # use absolute position
             acc_pred = self.acc_net(state_input)  # (B, 3)
             acc_pred = torch.clamp(acc_pred, -self.max_accel, self.max_accel)
 
-            # 指数平滑加速度（避免突变）
+            # Exponentially smooth acceleration (avoid abrupt changes)
             acc_state = 0.7 * acc_state + 0.3 * acc_pred
 
-            # 更新速度和位移
+            # Update velocity and displacement
             vel = vel + acc_state * dt
             pos_delta = pos_delta + vel * dt
 
-            # 记录相对位移（不含基准位置）
+            # Record relative displacement (excluding reference position)
             physics_preds.append(pos_delta.clone())
 
         return torch.stack(physics_preds, dim=1)  # (B, pred_len, 3)
 
 
 # ============================================================================
-# 子模块 4: 神经网络解码层
+# Submodule 4: Neural Decoder
 # ============================================================================
 
 class NeuralDecoder(nn.Module):
     """
-    神经网络解码器：将编码特征解码为位移增量
+    Neural decoder: decodes encoded features into displacement increments.
 
-    使用步长编码调制特征，确保不同步输出不同预测。
+    Modulates features with the step encoding so different steps produce different predictions.
     """
     def __init__(self, d_model: int, trajectory_dim: int = 6):
         super().__init__()
         self.d_model = d_model
 
-        # 特征 → 隐状态
+        # Feature -> hidden state
         self.proj = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.SiLU(),
             nn.Dropout(0.05),
         )
 
-        # 输出头：位移 + 不确定性（log(variance)）
+        # Output heads: displacement + uncertainty (log(variance))
         self.delta_head = nn.Linear(d_model, 3)
         self.var_head = nn.Sequential(
             nn.Linear(d_model, 32),
             nn.SiLU(),
             nn.Dropout(0.05),
             nn.Linear(32, 3),
-            nn.Softplus(),  # 输出 log(variance) ∈ (0, +∞)，确保方差为正
+            nn.Softplus(),  # output log(variance) in (0, +inf), ensures positive variance
         )
 
     def forward(
         self,
-        encoded: torch.Tensor,         # (B, d_model)  编码特征（取最后时刻或池化）
-        step_encoding: torch.Tensor,    # (pred_len, d_model)  步长编码
+        encoded: torch.Tensor,         # (B, d_model)  encoded feature (last step or pooled)
+        step_encoding: torch.Tensor,    # (pred_len, d_model)  step encoding
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            neural_delta:  (B, pred_len, 3)  神经网络位移增量
-            logvar:        (B, pred_len, 3)  对数方差（不确定性）
+            neural_delta:  (B, pred_len, 3)  neural displacement increment
+            logvar:        (B, pred_len, 3)  log variance (uncertainty)
         """
         B = encoded.shape[0]
         P = step_encoding.shape[0]
 
-        # 特征 + 步长编码
+        # Feature + step encoding
         feat = self.proj(encoded)                           # (B, d_model)
         feat = feat.unsqueeze(1) + step_encoding.unsqueeze(0)  # (B, pred_len, d_model)
 
-        # 展平批量和步长维度，统一解码
+        # Flatten batch and step dims, decode uniformly
         feat_flat = feat.reshape(B * P, self.d_model)       # (B*P, d_model)
 
         delta_flat = self.delta_head(feat_flat)             # (B*P, 3)
@@ -371,39 +347,32 @@ class NeuralDecoder(nn.Module):
 
 
 # ============================================================================
-# 子模块 5: 多假设神经网络解码器 (Multi-Hypothesis)
+# Submodule 5: Multi-Hypothesis Neural Decoder
 # ============================================================================
 
 class MultiHeadNeuralDecoder(nn.Module):
-    """
-    多假设神经网络解码器：K 个独立预测头 + 置信度评分头。
+    """Multi-hypothesis decoder: K independent prediction heads plus a confidence scoring head.
 
-    每个头独立预测一条轨迹。训练时使用 Winner-Takes-All (WTA) 损失：
-    - 计算 K 条轨迹各自的误差
-    - 选择误差最小的头作为 winner
-    - 仅通过 winner 反向传播
-
-    推理时输出 K 条轨迹 + K 个置信度分数。
-    用 minADE_K / minFDE_K 评估（取 K 条中最接近真值的）。
+    Trained with Winner-Takes-All loss; at inference outputs K trajectories with confidence scores.
     """
     def __init__(self, d_model: int, trajectory_dim: int = 6, K: int = 5):
         super().__init__()
         self.d_model = d_model
         self.K = K
 
-        # 共享的特征投影
+        # Shared feature projection
         self.proj = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.SiLU(),
             nn.Dropout(0.05),
         )
 
-        # K 个独立的位移预测头
+        # K independent displacement prediction heads
         self.delta_heads = nn.ModuleList([
             nn.Linear(d_model, 3) for _ in range(K)
         ])
 
-        # K 个独立的不确定性头
+        # K independent uncertainty heads
         self.var_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_model, 32),
@@ -414,7 +383,7 @@ class MultiHeadNeuralDecoder(nn.Module):
             ) for _ in range(K)
         ])
 
-        # 置信度评分头: 预测哪个假设最可能正确
+        # Confidence scoring head: predicts which hypothesis is most likely correct
         self.confidence_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.SiLU(),
@@ -428,26 +397,26 @@ class MultiHeadNeuralDecoder(nn.Module):
         return_all: bool = False,       # if True, return full dict; else return (delta, logvar) tuple
     ) -> Dict[str, torch.Tensor]:
         """
-        与 NeuralDecoder 兼容的接口：
-        - return_all=False: 返回 (best_delta, best_logvar) 元组
-        - return_all=True:  返回完整 dict
+        Interface compatible with NeuralDecoder:
+        - return_all=False: returns (best_delta, best_logvar) tuple
+        - return_all=True:  returns a full dict
 
         Returns (when return_all=True):
-            deltas:      (K, B, pred_len, 3)  K条轨迹位移
-            logvars:     (K, B, pred_len, 3)  每条的不确定性
-            confidences: (B, K)               置信度logits
-            best_delta:  (B, pred_len, 3)     最高置信度的轨迹
-            best_logvar: (B, pred_len, 3)     对应的不确定性
+            deltas:      (K, B, pred_len, 3)  K trajectory displacements
+            logvars:     (K, B, pred_len, 3)  per-trajectory uncertainty
+            confidences: (B, K)               confidence logits
+            best_delta:  (B, pred_len, 3)     highest-confidence trajectory
+            best_logvar: (B, pred_len, 3)     corresponding uncertainty
         """
         B = encoded.shape[0]
         P = step_encoding.shape[0]
 
-        # 共享特征投影
+        # Shared feature projection
         feat = self.proj(encoded)                           # (B, d_model)
         feat = feat.unsqueeze(1) + step_encoding.unsqueeze(0)  # (B, pred_len, d_model)
         feat_flat = feat.reshape(B * P, self.d_model)       # (B*P, d_model)
 
-        # K 个独立预测
+        # K independent predictions
         all_deltas = []
         all_logvars = []
         for k in range(self.K):
@@ -459,11 +428,11 @@ class MultiHeadNeuralDecoder(nn.Module):
         deltas = torch.stack(all_deltas, dim=0)              # (K, B, P, 3)
         logvars = torch.stack(all_logvars, dim=0)            # (K, B, P, 3)
 
-        # 置信度评分 (基于池化后的特征)
+        # Confidence scoring (based on pooled features)
         pooled_feat = feat.mean(dim=1)                       # (B, d_model)
         confidences = self.confidence_head(pooled_feat)      # (B, K)
 
-        # 最佳假设 (最高置信度)
+        # Best hypothesis (highest confidence)
         best_idx = confidences.argmax(dim=1)                 # (B,)
         best_delta = deltas[best_idx, torch.arange(B, device=encoded.device)]  # (B, P, 3)
         best_logvar = logvars[best_idx, torch.arange(B, device=encoded.device)]
@@ -488,24 +457,24 @@ class MultiHeadNeuralDecoder(nn.Module):
         targets: torch.Tensor,          # (B, P, 3)
     ) -> Dict[str, torch.Tensor]:
         """
-        Winner-Takes-All 损失。
+        Winner-Takes-All loss.
 
-        1. 计算每条轨迹的 L2 误差
-        2. 选择误差最小的作为 winner
-        3. MSE loss 仅通过 winner 反向传播
-        4. 置信度 loss 用交叉熵 (让模型学会预测哪个头最好)
+        1. Compute the L2 error of each trajectory
+        2. Select the one with the smallest error as the winner
+        3. MSE loss is backpropagated only through the winner
+        4. Confidence loss uses cross-entropy (teaches the model which head is best)
         """
         K, B, P, _ = deltas.shape
         device = deltas.device
 
-        # 每条轨迹的 MSE (B,)
+        # MSE per trajectory (B,)
         errors = []
         for k in range(K):
             err = F.mse_loss(deltas[k], targets, reduction='none').mean(dim=(1, 2))  # (B,)
             errors.append(err)
         error_matrix = torch.stack(errors, dim=1)  # (B, K)
 
-        # Winner = 最小误差
+        # Winner = smallest error
         winners = error_matrix.argmin(dim=1)  # (B,)
 
         # WTA displacement loss: only backprop through winner
@@ -517,7 +486,7 @@ class MultiHeadNeuralDecoder(nn.Module):
                     deltas[k][mask], targets[mask]
                 ) * mask.float().mean()
 
-        # Confidence loss: cross-entropy, 让模型学会预测 winner
+        # Confidence loss: cross-entropy, teaches the model to predict the winner
         conf_loss = F.cross_entropy(confidences, winners)
 
         return {
@@ -534,15 +503,15 @@ class MultiHeadNeuralDecoder(nn.Module):
         targets: torch.Tensor,          # (B, P, 3)
     ) -> Dict[str, torch.Tensor]:
         """
-        计算 minADE_K 和 minFDE_K：
-        对每个样本选择 K 条轨迹中误差最小的，计算指标。
+        Compute minADE_K and minFDE_K:
+        for each sample, pick the trajectory with the smallest error among K and compute the metrics.
 
-        标准的多假设评估指标。
+        Standard multi-hypothesis evaluation metrics.
         """
         K, B, P, _ = deltas.shape
 
-        # 每条轨迹的 ADE 和 FDE
-        all_ade = []  # K 个 (B,) tensor
+        # ADE and FDE per trajectory
+        all_ade = []  # K tensors of shape (B,)
         all_fde = []
         for k in range(K):
             step_errs = torch.norm(deltas[k] - targets, dim=-1)  # (B, P)
@@ -564,36 +533,36 @@ class MultiHeadNeuralDecoder(nn.Module):
 
 
 # ============================================================================
-# 主模块: UA-PGD
+# Main module: UA-PGD
 # ============================================================================
 
 class UncertaintyAwarePGD(nn.Module):
     """
-    不确定性感知物理引导解码器 (Uncertainty-Aware Physics-Guided Decoder)
+    Uncertainty-Aware Physics-Guided Decoder.
 
-    整体流程::
+    Overall flow::
 
         encoded_feat ──────────────────────────────────┐
                                                           │
-        global_anchor ──→ 与 encoded 融合 ──┐           │
-                                           ↓           │
-        历史轨迹 ──→ 运动学物理模型 ─→ physics_delta ─→ ┴→ 物理惯性门控混合 → 神经网络残差修正 → 最终位移
-                                           ↑           │
-        步长编码 ───────────────────────────────────────┘
+        global_anchor ──→ fuse with encoded ──┐          │
+                                           ↓             │
+        history ──→ kinematic physics model ─→ physics_delta ─→ ┴→ inertia-gate blend → neural residual → final displacement
+                                           ↑             │
+        step encoding ──────────────────────────────────┘
 
-    混合公式::
+    Blend formula::
 
         pred[t] = gate_inertia[t] * physics_delta[t]
                 + (1 - gate_inertia[t]) * (neural_delta[t] + global_anchor_contribution)
                 + gate_mode[t] * anchor_pull[t]
 
-    其中 anchor_pull[t] = gate_anchor[t] * (global_anchor - current_pos)
+    where anchor_pull[t] = gate_anchor[t] * (global_anchor - current_pos)
 
-    门控特性:
-        - gate_inertia:  机动时高，巡航时低，远期步更低
-        - gate_anchor:   步越远越强，悬停时强制增强
-        - gate_mode:     从意图权重映射，悬停意图 → 锚点主导
-        - gate_confidence: 从不确定性映射，高不确定性 → 锚点拉回增强
+    Gate behavior:
+        - gate_inertia:  high during maneuvers, low during cruise, lower for far steps
+        - gate_anchor:   stronger for farther steps, forced up when hovering
+        - gate_mode:     mapped from intent weights, hover intent -> anchor dominates
+        - gate_confidence: mapped from uncertainty, high uncertainty -> stronger anchor pull-back
     """
 
     def __init__(
@@ -610,7 +579,7 @@ class UncertaintyAwarePGD(nn.Module):
         self.traj_dim = trajectory_dim
         self.num_intent_classes = num_intent_classes
 
-        # 子模块
+        # Submodules
         self.step_encoder = OrthogonalStepEncoder(pred_len, d_model)
         self.physics_model = KinematicPhysicsModel(trajectory_dim)
         self.neural_decoder = NeuralDecoder(d_model, trajectory_dim)
@@ -621,23 +590,23 @@ class UncertaintyAwarePGD(nn.Module):
             pred_len=pred_len,
         )
 
-        # 全局锚点融合：锚点向量经 MLP 投影到位置空间
+        # Global anchor fusion: project the anchor vector to position space via an MLP
         self.anchor_to_pos = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.SiLU(),
             nn.Linear(d_model // 2, 3),
         )
 
-        # 特征压缩层（用于将编码特征投影到解码空间）
+        # Feature compression layer (project encoded feature into decoding space)
         self.feat_compress = nn.Linear(d_model, d_model)
 
-        # Dropout（防止过拟合）
+        # Dropout (prevent overfitting)
         self.dropout = nn.Dropout(p=dropout)
 
-        # 物理一致性损失权重（供外部 compute_loss 使用）
+        # Physics consistency loss weight (used by external compute_loss)
         self.physics_loss_weight = 0.05
 
-        # 初始化
+        # Initialization
         self._init_weights()
 
     def _init_weights(self):
@@ -658,48 +627,48 @@ class UncertaintyAwarePGD(nn.Module):
         intent_weights: Optional[torch.Tensor] = None,  # (B, num_intent_classes)
     ) -> Dict[str, torch.Tensor]:
         """
-        主前向传播。
+        Main forward pass.
 
         Args:
-            encoded_feat:         (B, T, d_model)   EMam-SE 编码特征
-            global_anchor:        (B, 1, d_model)   全局目标锚点
+            encoded_feat:         (B, T, d_model)   EMam-SE encoded feature
+            global_anchor:        (B, 1, d_model)   global target anchor
             historical_trajectory:(B, T, 6)          [x,y,z,vx,vy,vz]
-            return_uncertainty:  是否返回不确定性
-            intent_weights:       (B, num_intent_classes)  意图权重（若为None则用均匀分布）
+            return_uncertainty:  whether to return uncertainty
+            intent_weights:       (B, num_intent_classes)  intent weights (uniform if None)
 
         Returns:
-            predictions:  (B, pred_len, 3)  未来3D位移
-            logvar:      (B, pred_len, 3)  对数方差
-            (可选) gates: (B, pred_len, 4)  四个门控值（用于意图读出）
+            predictions:  (B, pred_len, 3)  future 3D displacement
+            logvar:      (B, pred_len, 3)  log variance
+            (optional) gates: (B, pred_len, 4)  four gate values (for intent read-out)
         """
         B, T, D = encoded_feat.shape
         P = self.pred_len
         device = encoded_feat.device
 
         # -------------------------------------------------------------------------
-        # 1. 正交步长编码
+        # 1. Orthogonal step encoding
         # -------------------------------------------------------------------------
         step_encoding = self.step_encoder()                        # (P, d_model)
         step_encoding = step_encoding.to(device)
 
         # -------------------------------------------------------------------------
-        # 2. 特征准备
+        # 2. Feature preparation
         # -------------------------------------------------------------------------
-        # 取最后时刻编码特征
+        # Take last-step encoded feature
         last_encoded = encoded_feat[:, -1, :]                       # (B, d_model)
         last_encoded = self.feat_compress(last_encoded)           # (B, d_model)
         last_encoded = self.dropout(last_encoded)
 
         # -------------------------------------------------------------------------
-        # 3. 全局锚点投影为位置目标
+        # 3. Project global anchor to position target
         # -------------------------------------------------------------------------
-        # anchor 从 (B, 1, d_model) → (B, 3) 位置
+        # anchor from (B, 1, d_model) -> (B, 3) position
         anchor_pos = self.anchor_to_pos(global_anchor.squeeze(1))  # (B, 3)
 
         # -------------------------------------------------------------------------
-        # 4. 物理惯性门控
+        # 4. Physics inertia gate
         # -------------------------------------------------------------------------
-        # 意图权重：若未提供，使用均匀分布
+        # Intent weights: use uniform distribution if not provided
         if intent_weights is None:
             intent_weights = torch.ones(B, self.num_intent_classes, device=device)
             intent_weights = intent_weights / self.num_intent_classes
@@ -709,23 +678,23 @@ class UncertaintyAwarePGD(nn.Module):
             intent_weights=intent_weights,
             step_encoding=step_encoding,
         )
-        # 各门控形状:
+        # Gate shapes:
         #   gate_inertia:      (B, P)
         #   gate_anchor:       (B, P)
         #   gate_confidence:   (B, P)
-        #   gate_mode:         (B, num_intent_classes)  逐意图类别模式强度
-        #   gate_mode_effective: (B, P)  加权映射后的步级模式强度
+        #   gate_mode:         (B, num_intent_classes)  per-intent mode strength
+        #   gate_mode_effective: (B, P)  weighted per-step mode strength
 
         # -------------------------------------------------------------------------
-        # 5. 物理模型多步外推
+        # 5. Multi-step physics extrapolation
         # -------------------------------------------------------------------------
-        # physics_trajectory: (B, P, 3)  多步物理位移序列（每步是从初始位置的外推位移）
+        # physics_trajectory: (B, P, 3)  multi-step physics displacement sequence (each step extrapolated from initial position)
         physics_trajectory = self.physics_model.multi_step(
             historical_trajectory, pred_len=P
         )  # (B, P, 3)
 
         # -------------------------------------------------------------------------
-        # 6. 神经网络解码
+        # 6. Neural decoding
         # -------------------------------------------------------------------------
         neural_delta, logvar = self.neural_decoder(
             encoded=last_encoded,           # (B, d_model)
@@ -733,56 +702,56 @@ class UncertaintyAwarePGD(nn.Module):
         )  # neural_delta: (B, P, 3), logvar: (B, P, 3)
 
         # -------------------------------------------------------------------------
-        # 7. 物理惯性门控混合（核心机制）
+        # 7. Physics inertia gate blending (core mechanism)
         # -------------------------------------------------------------------------
-        # 位置基准：最后时刻位置
+        # Position reference: last-step position
         last_pos = historical_trajectory[:, -1, :3]                  # (B, 3)
         last_pos_expanded = last_pos.unsqueeze(1).expand(-1, P, -1)  # (B, P, 3)
 
-        # 锚点拉回向量：(anchor_pos - last_pos) × gate_anchor
+        # Anchor pull-back vector: (anchor_pos - last_pos) x gate_anchor
         anchor_pull = (anchor_pos.unsqueeze(1) - last_pos_expanded)  # (B, P, 3)
         anchor_pull = anchor_pull * gate_anchor.unsqueeze(-1)         # (B, P, 3)
 
-        # 神经网络预测 + 锚点拉回（考虑置信度）
+        # Neural prediction + anchor pull-back (accounting for confidence)
         confidence_factor = gate_confidence.unsqueeze(-1)  # (B, P, 1)
         neural_guided = neural_delta + anchor_pull        # (B, P, 3)
-        neural_guided = neural_guided * confidence_factor  # 低置信度时降低神经网络权重
+        neural_guided = neural_guided * confidence_factor  # lower neural weight under low confidence
 
-        # 模式调制：悬停时增强锚点主导（mode越高，物理惯性越被锚点拉回压制）
+        # Mode modulation: strengthen anchor dominance when hovering (higher mode -> physics inertia more suppressed by anchor pull-back)
         gate_mode_exp = gate_mode_effective.unsqueeze(-1)  # (B, P, 1)
         inertia_effective = gate_inertia.unsqueeze(-1) * (1.0 - 0.3 * gate_mode_exp)  # (B, P, 1)
 
-        # 混合
+        # Blend
         blended = (
             inertia_effective * physics_trajectory
             + (1.0 - inertia_effective) * neural_guided
         )
 
         # -------------------------------------------------------------------------
-        # 8. 运动学约束（可选后处理，不修改梯度）
+        # 8. Kinematic constraint (optional post-processing, does not modify gradients)
         # -------------------------------------------------------------------------
-        # ★ _kinematic_postprocess 已禁用 — 阈值在归一化空间下单位错误，
-        # 会破坏正常预测（train RMSE 0.5m → eval RMSE 853m）。待修复后重新启用。
+        # * _kinematic_postprocess is disabled - thresholds have wrong units in normalized space
+        # and break normal predictions (train RMSE 0.5m -> eval RMSE 853m). Re-enable after fixing.
         # if not self.training:
         #     blended = self._kinematic_postprocess(blended, historical_trajectory)
 
         # -------------------------------------------------------------------------
-        # 9. 不确定性处理
+        # 9. Uncertainty handling
         # -------------------------------------------------------------------------
-        # Softplus 输出 ∈ (0, +∞)，但保留 clamp 作为数值安全边界
-        # clamp 范围 [-10, 10] 对应方差 [4.5e-5, 2.2e4]，覆盖合理区间
+        # Softplus output in (0, +inf), but keep clamp as a numerical safety bound
+        # clamp range [-10, 10] corresponds to variance [4.5e-5, 2.2e4], covering a reasonable interval
         logvar_clamped = logvar.clamp(-10.0, 10.0)
 
         return {
             'predictions': blended,              # (B, pred_len, 3)
             'logvar': logvar_clamped,            # (B, pred_len, 3)
-            'gate_inertia': gate_inertia,        # (B, pred_len)    惯性保留比例
-            'gate_anchor': gate_anchor,          # (B, pred_len)    锚点拉回强度
-            'gate_mode': gate_mode,              # (B, num_intent)  逐类别模式强度
-            'gate_confidence': gate_confidence,  # (B, pred_len)    置信度
-            'gate_mode_effective': gate_mode_effective,  # (B, pred_len) 步级模式强度
-            'physics_trajectory': physics_trajectory,  # (B, pred_len, 3) 物理外推位移
-            'neural_delta': neural_delta,        # (B, pred_len, 3) 神经位移增量
+            'gate_inertia': gate_inertia,        # (B, pred_len)    inertia retention ratio
+            'gate_anchor': gate_anchor,          # (B, pred_len)    anchor pull-back strength
+            'gate_mode': gate_mode,              # (B, num_intent)  per-class mode strength
+            'gate_confidence': gate_confidence,  # (B, pred_len)    confidence
+            'gate_mode_effective': gate_mode_effective,  # (B, pred_len) per-step mode strength
+            'physics_trajectory': physics_trajectory,  # (B, pred_len, 3) physics extrapolation displacement
+            'neural_delta': neural_delta,        # (B, pred_len, 3) neural displacement increment
         }
 
     def forward_multi_head(
@@ -793,15 +762,15 @@ class UncertaintyAwarePGD(nn.Module):
         intent_weights: Optional[torch.Tensor] = None,  # (B, num_intent_classes)
     ) -> Dict[str, torch.Tensor]:
         """
-        多假设前向传播：使用 MultiHeadNeuralDecoder 生成 K 条轨迹。
+        Multi-hypothesis forward pass: uses MultiHeadNeuralDecoder to generate K trajectories.
 
-        共享组件（物理外推、门控、锚点）计算一次，然后与 K 个神经预测分别混合。
+        Shared components (physics extrapolation, gates, anchor) are computed once, then blended with each of the K neural predictions.
         """
         B, T, D = encoded_feat.shape
         P = self.pred_len
         device = encoded_feat.device
 
-        # ---- 共享组件 (与 forward 相同) ----
+        # ---- Shared components (same as forward) ----
         step_encoding = self.step_encoder().to(device)              # (P, d_model)
 
         last_encoded = encoded_feat[:, -1, :]                       # (B, d_model)
@@ -824,7 +793,7 @@ class UncertaintyAwarePGD(nn.Module):
             historical_trajectory, pred_len=P
         )  # (B, P, 3)
 
-        # 锚点拉回向量
+        # Anchor pull-back vector
         last_pos = historical_trajectory[:, -1, :3]                  # (B, 3)
         last_pos_expanded = last_pos.unsqueeze(1).expand(-1, P, -1)  # (B, P, 3)
         anchor_pull = (anchor_pos.unsqueeze(1) - last_pos_expanded)  # (B, P, 3)
@@ -834,7 +803,7 @@ class UncertaintyAwarePGD(nn.Module):
         gate_mode_exp = gate_mode_effective.unsqueeze(-1)             # (B, P, 1)
         inertia_effective = gate_inertia.unsqueeze(-1) * (1.0 - 0.3 * gate_mode_exp)
 
-        # ---- 多假设解码 ----
+        # ---- Multi-hypothesis decoding ----
         if not isinstance(self.neural_decoder, MultiHeadNeuralDecoder):
             raise RuntimeError(
                 'forward_multi_head requires MultiHeadNeuralDecoder. '
@@ -852,7 +821,7 @@ class UncertaintyAwarePGD(nn.Module):
 
         K = deltas.shape[0]
 
-        # 对每个假设分别混合
+        # Blend each hypothesis separately
         all_blended = []
         for k in range(K):
             neural_delta_k = deltas[k]                                 # (B, P, 3)
@@ -867,19 +836,19 @@ class UncertaintyAwarePGD(nn.Module):
         all_blended = torch.stack(all_blended, dim=0)  # (K, B, P, 3)
         all_logvars = logvars.clamp(-10.0, 10.0)       # (K, B, P, 3)
 
-        # 逆归一化: 与 model.py forward() 中 Step 5 一致
+        # De-normalization: consistent with Step 5 in model.py forward()
         _scale_pos = 100.0
         all_blended = all_blended * _scale_pos
         physics_trajectory = physics_trajectory * _scale_pos
 
-        # 最佳假设
+        # Best hypothesis
         best_idx = confidences.argmax(dim=1)            # (B,)
         best_pred = all_blended[best_idx, torch.arange(B, device=device)]  # (B, P, 3)
         best_logvar = all_logvars[best_idx, torch.arange(B, device=device)]
 
         return {
-            'predictions': best_pred,          # (B, P, 3) 最高置信度轨迹 (meters)
-            'all_predictions': all_blended,    # (K, B, P, 3) K条轨迹 (meters)
+            'predictions': best_pred,          # (B, P, 3) highest-confidence trajectory (meters)
+            'all_predictions': all_blended,    # (K, B, P, 3) K trajectories (meters)
             'all_logvars': all_logvars,        # (K, B, P, 3)
             'confidences': confidences,        # (B, K)
             'logvar': best_logvar,             # (B, P, 3)
@@ -890,7 +859,7 @@ class UncertaintyAwarePGD(nn.Module):
         }
 
     def replace_with_multi_head(self, K: int, noise_std: float = 0.02):
-        """替换 NeuralDecoder 为 MultiHeadNeuralDecoder 并初始化权重。"""
+        """Replace NeuralDecoder with MultiHeadNeuralDecoder and initialize weights."""
         old_decoder = self.neural_decoder
         new_decoder = MultiHeadNeuralDecoder(
             d_model=self.d_model,
@@ -898,12 +867,12 @@ class UncertaintyAwarePGD(nn.Module):
             K=K,
         )
 
-        # 复制投影层
+        # Copy projection layer
         for p_old, p_new in zip(old_decoder.proj.parameters(), new_decoder.proj.parameters()):
             if p_old.shape == p_new.shape:
                 p_new.data.copy_(p_old.data)
 
-        # 复制并扰动 K 个头
+        # Copy and perturb the K heads
         orig_w = old_decoder.delta_head.weight.data.clone()
         orig_b = old_decoder.delta_head.bias.data.clone()
         w_std = orig_w.std()
@@ -932,22 +901,22 @@ class UncertaintyAwarePGD(nn.Module):
         max_jerk: float = 30.0,
     ) -> torch.Tensor:
         """
-        推理时的运动学后处理（强制物理一致性）。
+        Inference-time kinematic post-processing (enforces physical consistency).
 
-        对预测轨迹做运动学可行性检验：
-        1. 加速度上界约束
-        2. 速度上界约束
-        3. 位置突变检验
+        Applies kinematic feasibility checks to the predicted trajectory:
+        1. Acceleration upper bound
+        2. Velocity upper bound
+        3. Position jump check
 
-        此函数仅在推理时调用，不影响训练梯度。
+        Called only at inference; does not affect training gradients.
         """
         dt = 0.1
         preds = predictions.clone()
 
-        # 速度约束：最大速度 50 m/s
+        # Velocity constraint: max speed 50 m/s
         max_vel = 50.0
 
-        # 计算预测的速度和加速度
+        # Compute predicted velocity and acceleration
         pos_history = history[:, -1, :3]                      # (B, 3)
         pos_series = torch.cat([pos_history.unsqueeze(1), preds], dim=1)  # (B, P+1, 3)
 
@@ -955,23 +924,23 @@ class UncertaintyAwarePGD(nn.Module):
             pos_curr = pos_series[:, step + 1, :]
             pos_prev = pos_series[:, step, :]
 
-            # 速度
+            # Velocity
             vel = (pos_curr - pos_prev) / dt
             vel_norm = torch.norm(vel, dim=-1, keepdim=True)  # (B, 1)
             vel = vel / (vel_norm.clamp(min=1e-6)) * vel_norm.clamp(max=max_vel)
             vel_clamped = vel
 
-            # 加速度
+            # Acceleration
             if step > 0:
                 pos_pp = pos_series[:, step - 1, :]
                 vel_prev = (pos_prev - pos_pp) / dt
                 acc = (vel_clamped - vel_prev) / dt
                 acc_norm = torch.norm(acc, dim=-1, keepdim=True)
 
-                # 加速度约束
+                # Acceleration constraint
                 acc = acc / (acc_norm.clamp(min=1e-6)) * acc_norm.clamp(max=max_accel)
 
-                # 修正位置：使用约束后的加速度重新计算
+                # Correct position: recompute using the constrained acceleration
                 pos_corrected = pos_prev + vel_prev * dt + 0.5 * acc * (dt ** 2)
                 pos_series[:, step + 1, :] = pos_corrected
 
@@ -985,15 +954,15 @@ class UncertaintyAwarePGD(nn.Module):
         gate_inertia: torch.Tensor,
     ) -> torch.Tensor:
         """
-        物理一致性损失：鼓励在高惯性区域（机动）预测接近物理外推，
-                       在低惯性区域（巡航）接近神经网络预测。
+        Physics consistency loss: encourages predictions to stay close to physics extrapolation
+        in high-inertia regions (maneuvers) and close to the neural prediction in low-inertia regions (cruise).
 
-        损失 = |pred - physics| * gate_inertia + |pred - neural| * (1 - gate_inertia)
+        loss = |pred - physics| * gate_inertia + |pred - neural| * (1 - gate_inertia)
 
-        但由于 neural_delta 未知，这里简化为：
-        损失 = |pred - physics| * gate_inertia.mean()
+        Since neural_delta is unknown here, this is simplified to:
+        loss = |pred - physics| * gate_inertia.mean()
 
-        即：机动时（gate_inertia高），强制预测贴近物理模型。
+        i.e., during maneuvers (high gate_inertia), force predictions to stay close to the physics model.
         """
         residual = (predictions - physics_trajectory).abs()   # (B, P, 3)
         physics_loss = (residual * gate_inertia.unsqueeze(-1)).mean()

@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-3D轨迹预测可视化 — 简洁排版
-每个样本一行: 3D视图 | XY俯视图(正方形) | 误差表
-低/高速各一张图, 真实数据。
-"""
+"""3D trajectory prediction visualization: one row per sample (3D | XY top-down | error table)."""
 
 import torch, numpy as np, sys
 import matplotlib
@@ -23,7 +19,7 @@ MCOLORS = ['#FF9800','#FF5722','#E91E63','#9C27B0']
 
 
 def draw_3d(ax, r, markers):
-    """3D轨迹 + 时间节点标记"""
+    """3D trajectory + time-step markers"""
     last = r['hist'][-1,:3].cpu().numpy()
     hp = r['hist'][:,:3].cpu().numpy()
     pa = r['pred'].cpu().numpy() + last
@@ -49,7 +45,7 @@ def draw_3d(ax, r, markers):
 
 
 def draw_xy(ax, r, markers):
-    """XY俯视图 — 正方形, 两轴独立scale"""
+    """XY top-down view — square, independent axis scale"""
     last = r['hist'][-1,:2].cpu().numpy()
     hp = r['hist'][:,:2].cpu().numpy()
     pa = r['pred'].cpu().numpy()[:,:2] + last
@@ -70,13 +66,13 @@ def draw_xy(ax, r, markers):
 
     ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)')
     ax.set_title('XY Top-down View', fontsize=10, fontweight='bold')
-    # 正方形: 强制axes box为正方形
+    # Force square axes box
     ax.set_box_aspect(1)
     ax.grid(True, alpha=0.3)
 
 
 def draw_error_table(ax_table, r):
-    """误差表"""
+    """Error table"""
     ax_table.axis('off')
     markers = r['markers']
     errs = [r['step_err'][fi] for fi in markers.values()]
@@ -99,7 +95,7 @@ def draw_error_table(ax_table, r):
 
 
 def build_results(p, ds_low, ds_high):
-    """收集12个样本"""
+    """Collect 12 samples"""
     np.random.seed(42)
     low_idx = np.random.choice(len(ds_low), 6, replace=False)
     high_idx = np.random.choice(len(ds_high), 20, replace=False)
@@ -135,7 +131,7 @@ def build_results(p, ds_low, ds_high):
 
 
 def make_figure(results, title_prefix, out_path):
-    """生成一张图: 每个样本一行 [3D | XY | 误差表]"""
+    """Generate one figure: one row per sample [3D | XY | error table]"""
     n = len(results)
     fig = plt.figure(figsize=(22, 5.5 * n))
     fig.suptitle(title_prefix, fontsize=15, fontweight='bold', y=0.995)
@@ -149,7 +145,7 @@ def make_figure(results, title_prefix, out_path):
         ax_xy = fig.add_subplot(n, 3, 3*i+2)
         draw_xy(ax_xy, r, r['markers'])
 
-        # 误差表
+        # Error table
         ax_tbl = fig.add_subplot(n, 3, 3*i+3)
         draw_error_table(ax_tbl, r)
 
@@ -159,7 +155,7 @@ def make_figure(results, title_prefix, out_path):
 
 
 def make_error_curve(low_res, high_res, out_path):
-    """逐进度误差曲线"""
+    """Per-progress error curves"""
     fig, (ax_l, ax_h) = plt.subplots(1, 2, figsize=(18, 7))
     fig.suptitle('3D Position Error by Prediction Progress', fontsize=14, fontweight='bold')
     x_t = [25,50,75,100]
@@ -218,7 +214,7 @@ def main():
 
     make_error_curve(low_r, high_r, out_dir / '03_error_curves.png')
 
-    # 数据表
+    # Data table
     print(f'\n{"="*110}')
     for name, res in [('LOW-SPEED', low_r), ('HIGH-SPEED', high_r)]:
         print(f'\n--- {name} ---')

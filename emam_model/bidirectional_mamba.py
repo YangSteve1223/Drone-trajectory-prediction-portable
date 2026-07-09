@@ -1,25 +1,4 @@
-"""
-Bidirectional Mamba Encoder - 完整实现
-
-来源论文: Motion Mamba / Mamba (SSM)
-核心机制: 双向选择性状态空间模型
-    - 前向扫描: t = 0 → T-1, h_init = 0
-    - 后向扫描: t = T-1 → 0, h_init = 0 (时间翻转)
-    - 门控融合: fused = gate * forward + (1 - gate) * backward
-
-Mamba 选择性 SSM 核心公式:
-    选择性机制: B_t = linear(x_t), C_t = linear(x_t) (输入依赖)
-    A_discrete = exp(dt * ΔA), dt = softplus(log_dt)
-    状态更新: h_t = A_discrete · h_{t-1} + B_t · x_t
-    输出: y_t = einsum(C_t, h_t) + D · x_t
-
-与原论文Motion Mamba差异:
-    - Motion Mamba BSM: 沿通道维度扫描 (C, B, T) 排列
-    - EMam-SE: 沿时间维度扫描 (B, T, D)，更符合轨迹预测需求
-    - 本实现: 使用输入依赖的选择性B/C（符合Mamba原论文）
-
-集成位置: 并行于 EMam-SE，残差增强 encoded 特征
-"""
+"""Bidirectional selective SSM encoder with gated forward/backward fusion."""
 
 import torch
 import torch.nn as nn
@@ -28,18 +7,7 @@ from typing import Tuple
 
 
 class BidirectionalSelectiveSSM(nn.Module):
-    """
-    双向选择性状态空间模型
-    
-    实现双向SSM扫描，分别捕获前向和后向的时间依赖关系。
-    基于Mamba选择性机制，B和C都是输入依赖的。
-    
-    核心公式:
-        A_discrete = exp(dt * A), 其中 dt = softplus(x_dt)
-        B_t = linear(x_inner), C_t = linear(x_inner)  # 选择性
-        h_t = A_discrete · h_{t-1} + B_t · x_inner
-        y_t = C_t · h_t + D · x_inner
-    """
+    """Bidirectional SSM with input-dependent B/C selective mechanism."""
     
     def __init__(
         self,
@@ -53,16 +21,16 @@ class BidirectionalSelectiveSSM(nn.Module):
         self.d_state = d_state
         self.d_inner = int(expand * d_model)
 
-        # === 输入投影: x → [x_conv, x_dt] ===
+        # === Input projection: x → [x_conv, x_dt] ===
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=True)
 
-        # === SSM核心参数 ===
-        # A: 状态演化矩阵 (d_inner, d_state)
+        # === SSM core parameters ===
+        # A: state evolution matrix (d_inner, d_state)
         self.A = nn.Parameter(torch.randn(self.d_inner, d_state))
-        # D: 跳接矩阵 (d_inner,)
+        # D: skip-connection matrix (d_inner,)
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
-        # === 局部因果卷积 ===
+        # === Local causal convolution ===
         self.conv1d = nn.Conv1d(
             self.d_inner, self.d_inner,
             kernel_size=d_conv,
@@ -71,20 +39,20 @@ class BidirectionalSelectiveSSM(nn.Module):
             bias=True
         )
 
-        # === 输出投影 ===
+        # === Output projection ===
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
         self._init_parameters()
 
     def _init_parameters(self):
-        """初始化SSM参数"""
-        # A矩阵: 取负值保证状态稳定 (exp(-|A|) ∈ (0,1))
+        """Initialize SSM parameters."""
+        # A matrix: negative values ensure state stability (exp(-|A|) ∈ (0,1))
         nn.init.xavier_uniform_(self.A)
         with torch.no_grad():
             self.A.copy_(-torch.abs(self.A))
-        # D矩阵: 全1
+        # D matrix: all ones
         nn.init.ones_(self.D)
-        # 卷积层初始化
+        # Conv layer init
         nn.init.kaiming_normal_(self.conv1d.weight, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.conv1d.bias)
 
@@ -94,12 +62,12 @@ class BidirectionalSelectiveSSM(nn.Module):
         reverse: bool = False,
     ) -> torch.Tensor:
         """
-        SSM序列扫描
-        
+        SSM sequence scan.
+
         Args:
-            x_conv: (B, T, d_inner) 卷积后的特征
-            reverse: 是否反向扫描
-        
+            x_conv: (B, T, d_inner) features after convolution
+            reverse: whether to scan in reverse
+
         Returns:
             output: (B, T, d_inner)
         """
@@ -108,27 +76,27 @@ class BidirectionalSelectiveSSM(nn.Module):
         if reverse:
             x_conv = torch.flip(x_conv, dims=[1])
         
-        # === 选择性参数计算 ===
-        # dt: softplus确保正值
+        # === Selective parameter computation ===
+        # dt: softplus ensures positive values
         dt = F.softplus(x_conv)  # (B, T, d_inner)
-        
-        # A离散化: A_dis[b,t,i,k] = exp(dt[b,t,i] * A[i,k])
-        # 结果形状: (B, T, d_inner, d_state)
-        # 数值稳定性: dt*A 可能过大导致 exp 爆炸，clamp 到 [-50, 50]
+
+        # A discretization: A_dis[b,t,i,k] = exp(dt[b,t,i] * A[i,k])
+        # Result shape: (B, T, d_inner, d_state)
+        # Numerical stability: dt*A may cause exp explosion, clamp to [-50, 50]
         dt_A = torch.einsum('btd,dn->btdn', dt, self.A)
         dt_A = dt_A.clamp(min=-50.0, max=50.0)
         A_dis = torch.exp(dt_A)
-        
-        # 选择性B: B_t = x_conv (直接使用，无额外投影)
-        # 选择性C: C_t = x_conv (直接使用，无额外投影)
+
+        # Selective B: B_t = x_conv (used directly, no extra projection)
+        # Selective C: C_t = x_conv (used directly, no extra projection)
         B_t = x_conv  # (B, T, d_inner)
         C_t = x_conv  # (B, T, d_inner)
-        
-        # === SSM扫描 ===
-        # 初始化隐状态: h_0 = 0
-        h = torch.zeros(B, self.d_inner, self.d_state, 
+
+        # === SSM scan ===
+        # Initialize hidden state: h_0 = 0
+        h = torch.zeros(B, self.d_inner, self.d_state,
                        device=x_conv.device, dtype=x_conv.dtype)
-        
+
         outputs = []
         for t in range(T):
             A_t = A_dis[:, t]        # (B, d_inner, d_state)
@@ -138,12 +106,9 @@ class BidirectionalSelectiveSSM(nn.Module):
             # h_term[b,i] = Σ_k A_t[b,i,k] * h[b,i,k]
             h_term = torch.einsum('bik,bik->bi', A_t, h)  # (B, d_inner)
 
-            # h_new[b,i,k] = h_term[b,i] * A_t[b,i,k] + B_t[b,i] * C_t[b,i]
-            # 与 emam_se.py 一致: h_new = h_term * A_t + B_t * C_t
-            # B_t_t.unsqueeze(-1): (B, d_inner, 1), C_t_t.unsqueeze(-1): (B, d_inner, 1)
-            # 结果: (B, d_inner, d_state)
+            # Consistent with emam_se.py: h_new = h_term * A_t + B_t * C_t
             h_new = h_term.unsqueeze(-1) * A_t + B_t_t.unsqueeze(-1) * C_t_t.unsqueeze(-1)
-            h_new = h_new.clamp(-10, 10)  # 数值稳定性
+            h_new = h_new.clamp(-10, 10)  # numerical stability
 
             # y_t[b,i] = Σ_k C_t[b,i] * h_new[b,i,k] + D[i] * C_t[b,i]
             y_t = torch.einsum('bi,bik->bi', C_t_t, h_new) + self.D * C_t_t
@@ -160,36 +125,36 @@ class BidirectionalSelectiveSSM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        双向SSM前向传播
-        
+        Bidirectional SSM forward pass.
+
         Args:
             x: (B, T, D)
-        
+
         Returns:
-            forward_out: (B, T, D) 前向扫描结果
-            backward_out: (B, T, D) 后向扫描结果
+            forward_out: (B, T, D) forward scan result
+            backward_out: (B, T, D) backward scan result
         """
         B, T, D = x.shape
-        
-        # === 输入投影 ===
+
+        # === Input projection ===
         xz = self.in_proj(x)  # (B, T, 2*d_inner)
         x_conv_raw, x_dt_raw = xz.chunk(2, dim=-1)
-        
-        # === 预处理 ===
-        # 结合x_conv_raw和x_dt_raw计算dt
+
+        # === Preprocessing ===
+        # Combine x_conv_raw and x_dt_raw to compute dt
         dt_input = x_conv_raw * torch.sigmoid(x_dt_raw)
-        
-        # === 因果卷积 ===
+
+        # === Causal convolution ===
         x_conv = dt_input.transpose(1, 2)  # (B, d_inner, T)
-        x_conv = self.conv1d(x_conv)[:, :, :T]  # 截断
+        x_conv = self.conv1d(x_conv)[:, :, :T]  # truncate
         x_conv = x_conv.transpose(1, 2)  # (B, T, d_inner)
-        x_conv = F.silu(x_conv)  # SiLU激活
-        
-        # === 双向SSM扫描 ===
+        x_conv = F.silu(x_conv)  # SiLU activation
+
+        # === Bidirectional SSM scan ===
         forward_out = self._ssm_scan(x_conv, reverse=False)
         backward_out = self._ssm_scan(x_conv, reverse=True)
-        
-        # === 输出投影 ===
+
+        # === Output projection ===
         forward_out = self.out_proj(forward_out)
         backward_out = self.out_proj(backward_out)
         
@@ -198,22 +163,22 @@ class BidirectionalSelectiveSSM(nn.Module):
 
 class GatedFusion(nn.Module):
     """
-    门控融合层
-    
-    融合前向和后向SSM特征:
+    Gated fusion layer.
+
+    Fuses forward and backward SSM features:
         output = σ(w_g) * forward + (1 - σ(w_g)) * backward
-    
-    数值稳定性:
-        - 使用sigmoid确保输出在[0,1]范围
-        - 避免极端的门控值导致梯度消失
+
+    Numerical stability:
+        - Sigmoid ensures output in [0,1] range
+        - Avoids extreme gate values that cause vanishing gradients
     """
     def __init__(self, d_model: int):
         super().__init__()
-        # Xavier初始化: 初始门控值≈0.5（前向后向均衡），加速收敛
-        # zero init 会导致 sigmoid(0)=0.5，梯度更小收敛更慢
+        # Xavier init: initial gate ≈0.5 (balanced forward/backward), faster convergence
+        # zero init gives sigmoid(0)=0.5 but smaller gradients and slower convergence
         self.gate_weight = nn.Parameter(torch.zeros(d_model))
-        # Xavier uniform 对 dim=64: range ≈ ±√(6/(1+64)) ≈ ±0.30, sigmoid 后集中在 0.5±0.07
-        # 改用正态分布: std=0.5 → sigmoid 输出 spread ≈ 0.2, 梯度更明显
+        # Xavier uniform for dim=64: range ≈ ±√(6/(1+64)) ≈ ±0.30, sigmoid centered at 0.5±0.07
+        # Using normal instead: std=0.5 → sigmoid output spread ≈ 0.2, more noticeable gradients
         nn.init.normal_(self.gate_weight, mean=0.0, std=0.5)
         
     def forward(
@@ -229,17 +194,17 @@ class GatedFusion(nn.Module):
 
 class BidirectionalMambaEncoder(nn.Module):
     """
-    双向 Mamba 编码器
-    
-    使用双向选择性SSM进行时序特征提取:
-    - Forward: 从 t=0 扫描到 t=T-1
-    - Backward: 从 t=T-1 扫描到 t=0 (时间翻转)
-    - Gate fusion: 可学习门控网络
-    
+    Bidirectional Mamba encoder.
+
+    Uses bidirectional selective SSM for temporal feature extraction:
+    - Forward: scan from t=0 to t=T-1
+    - Backward: scan from t=T-1 to t=0 (time-reversed)
+    - Gate fusion: learnable gating network
+
     Architecture:
         Input → Bi-SSM → Gated Fusion → Output
     """
-    
+
     def __init__(
         self,
         d_model: int,
@@ -253,16 +218,16 @@ class BidirectionalMambaEncoder(nn.Module):
         self.d_model = d_model
         self.d_state = d_state
         self.fusion_type = fusion_type
-        
-        # === 双向SSM核心 ===
+
+        # === Bidirectional SSM core ===
         self.bi_ssm = BidirectionalSelectiveSSM(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
         )
-        
-        # === 融合层 ===
+
+        # === Fusion layer ===
         if fusion_type == 'gate':
             self.fusion = GatedFusion(d_model)
         elif fusion_type == 'concat':
@@ -275,12 +240,12 @@ class BidirectionalMambaEncoder(nn.Module):
             self.fusion = nn.Identity()
         else:
             raise ValueError(f"Unknown fusion_type: {fusion_type}")
-        
-        # === 归一化和Dropout ===
+
+        # === Normalization and Dropout ===
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(p=dropout)
-        
-        # === 残差投影 ===
+
+        # === Residual projection ===
         self.residual_proj = nn.Linear(d_model, d_model, bias=False) if expand != 1 else None
 
     def forward(
@@ -290,31 +255,31 @@ class BidirectionalMambaEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
-            x: (B, T, d_model) 输入序列
-            return_intermediate: 是否返回前向/后向特征
-        
+            x: (B, T, d_model) input sequence
+            return_intermediate: whether to return forward/backward features
+
         Returns:
-            forward_features: (B, T, D) 前向扫描特征
-            backward_features: (B, T, D) 后向扫描特征
-            fused: (B, T, D) 融合特征
+            forward_features: (B, T, D) forward scan features
+            backward_features: (B, T, D) backward scan features
+            fused: (B, T, D) fused features
         """
-        # 残差连接
+        # Residual connection
         residual = x
         if self.residual_proj is not None:
             residual = self.residual_proj(residual)
-        
-        # === 双向SSM ===
+
+        # === Bidirectional SSM ===
         forward_out, backward_out = self.bi_ssm(x)
-        
-        # === 融合 ===
+
+        # === Fusion ===
         if self.fusion_type == 'gate':
             fused = self.fusion(forward_out, backward_out)
         elif self.fusion_type == 'concat':
             fused = self.fusion(torch.cat([forward_out, backward_out], dim=-1))
         elif self.fusion_type == 'add':
             fused = forward_out + backward_out
-        
-        # === 残差连接 + 归一化 ===
+
+        # === Residual + normalization ===
         fused = fused + residual
         fused = self.norm(fused)
         fused = self.dropout(fused)

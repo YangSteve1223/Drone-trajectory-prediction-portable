@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""双模型速度硬切换推理 + LoRA在线持续学习。"""
+"""Dual-model speed-switched inference with online LoRA adaptation."""
 
 import torch
 import warnings
@@ -30,62 +30,51 @@ def _detect_device(verbose=True):
 _DEVICE = _detect_device()
 _WEIGHT_DIR = Path(__file__).parent / 'weights'
 
-# 速度阈值 (m/s): <5 → 低速模型, ≥5 → 高速模型
+# Speed threshold (m/s): <5 low model, >=5 high model
 S_THRESHOLD = 5.0
 
-# 软融合: 替代硬切换, 在阈值附近平滑过渡
-# α = sigmoid((speed - threshold) / temperature)
-# temperature 越小过渡越陡 (0.1 ≈ 硬切换), 越大过渡越平滑
-# 过渡区外使用硬分配, 避免一个模型在另一个的数据域上预测
+# Soft fusion: smooth sigmoid transition instead of hard switch near threshold
 SOFT_FUSION_ENABLED = True
-FUSION_TEMPERATURE = 1.2       # sigmoid 温度参数
-FUSION_HALF_WIDTH = 3.0        # 过渡区半宽 (m/s), 仅在 [threshold-width, threshold+width] 内混合
+FUSION_TEMPERATURE = 1.2       # sigmoid temperature
+FUSION_HALF_WIDTH = 3.0        # transition half-width (m/s); blend only within [threshold +/- width]
 
-# Z轴纠正: HIGH模型处理DESCEND意图的Z分量
-# 问题: 模型对DESCEND的预测概率偏低 (真下降仅5-12%, 假阳性也是6-12%)
-# 原来一刀切20%阈值 → 真假都压制95% → 真下降的Z预测被错误清零
-# 修复: 三段式连续过渡, 在不确定区(5-20%)部分允许Z分量
+# Z correction: dampen Z component of HIGH model DESCEND intent via 3-segment transition
 Z_CORRECTION_ENABLED = True
-Z_DESCEND_THRESHOLD_LOW = 0.05   # 低于此: 确信非下降, 强压制
-Z_DESCEND_THRESHOLD_HIGH = 0.20  # 高于此: 确信下降, 不压制
-Z_DAMPEN_STRONG = 0.05           # 强压制: Z保留5% (非下降时几乎清零Z漂移)
-Z_DAMPEN_WEAK = 0.30             # 弱压制: Z保留30% (不确定区, 允许部分Z)
+Z_DESCEND_THRESHOLD_LOW = 0.05   # below: confident non-descent, strong dampen
+Z_DESCEND_THRESHOLD_HIGH = 0.20  # above: confident descent, no dampen
+Z_DAMPEN_STRONG = 0.05           # strong dampen: keep 5% of Z
+Z_DAMPEN_WEAK = 0.30             # weak dampen: keep 30% of Z
 
-# Z轴趋势感知: 用多种信号判断模型DESCEND预测是否可信
-# 信号1: Z历史趋势 (仅当Z历史有变化时有效, SimCruise的DESCEND样本Z历史全为0)
-# 信号2: 模型Z轴不确定性 — 低不确定性=模型自信=减弱压制
-# 信号3: 预测Z位移量级 — 大位移下降=更像真下降
+# Z trend awareness: signals that raise confidence a DESCEND prediction is real
 Z_TREND_ENABLED = True
-Z_TREND_WINDOW = 10              # 分析最近N帧的Z趋势
-Z_TREND_DESCENT_THRESH = -0.03   # Z速度阈值 (m/s per frame)
-Z_TREND_DAMPEN_BOOST = 0.15      # 每个信号满足后 dampen因子增加值
+Z_TREND_WINDOW = 10              # frames analyzed for Z trend
+Z_TREND_DESCENT_THRESH = -0.03   # Z velocity threshold (m/s per frame)
+Z_TREND_DAMPEN_BOOST = 0.15      # dampen boost per satisfied signal
 
-# 模型不确定性感知: 利用UA-PGD输出的logvar判断Z预测是否可靠
+# Model uncertainty: use UA-PGD logvar to judge Z prediction reliability
 Z_UNCERTAINTY_ENABLED = True
-Z_UNCERTAINTY_THRESH = -2.0      # logvar < -2.0 → 低不确定性 → 模型自信 → 减弱压制
-Z_UNCERTAINTY_BOOST = 0.20       # 低不确定性时 dampen因子增加值
+Z_UNCERTAINTY_THRESH = -2.0      # logvar < -2.0 -> low uncertainty -> weaken dampen
+Z_UNCERTAINTY_BOOST = 0.20       # dampen boost when uncertainty is low
 
-# 预测Z位移量级: 大位移下降更可能是真下降
+# Predicted Z displacement magnitude: large descent more likely real
 Z_MAGNITUDE_ENABLED = True
-Z_MAGNITUDE_THRESH = 5.0         # 预测Z位移 < -5m → 可能真下降
-Z_MAGNITUDE_BOOST = 0.15         # 大位移下降时 dampen因子增加值
+Z_MAGNITUDE_THRESH = 5.0         # predicted Z displacement < -5m -> possibly real descent
+Z_MAGNITUDE_BOOST = 0.15         # dampen boost for large descent
 
-# 熵引导物理融合: LOW模型在意图不确定时偏向物理外推
-# 诊断: 最差样本(TURN→STRAIGHT错配)熵>0.7, 神经anchor预测直线但物理模型保留转弯动量
-# 熵越高 → 越依赖物理外推 → 保留转弯, 抑制错误的STRAIGHT anchor
-ENTROPY_PHYSICS_ENABLED = False  # 测试未通过: 物理模型过于简单(2帧速度估算), 叠加后反而降低转弯精度
-ENTROPY_THRESHOLD = 0.4         # 意图熵>0.4时触发物理偏向
-ENTROPY_MAX_BLEND = 0.35        # 最多额外叠加35%物理权重
+# Entropy-guided physics fusion: LOW model leans on physics extrapolation when intent is uncertain
+ENTROPY_PHYSICS_ENABLED = False  # disabled: physics model too simple, hurts turn accuracy
+ENTROPY_THRESHOLD = 0.4         # intent entropy > 0.4 triggers physics bias
+ENTROPY_MAX_BLEND = 0.35        # max extra physics weight
 
-# 4-class → 6-class 意图映射
+# 4-class -> 6-class intent mapping
 _C4_TO_C6 = {0: 0, 1: 1, 2: 2, 3: 4}
 
 
 class DronePredictor:
-    """无人机轨迹预测器 — 双模型速度硬切换。
+    """Drone trajectory predictor with speed-based dual-model routing.
 
-    speed < S_THRESHOLD → low model (UAV-Flow, 6-class, 5Hz, 0-3 m/s domain)
-    speed >= S_THRESHOLD → high model (SimCruise, 4-class, 1Hz, 8-28 m/s domain)
+    speed < S_THRESHOLD -> low model (UAV-Flow, 6-class, 5Hz, 0-3 m/s domain)
+    speed >= S_THRESHOLD -> high model (SimCruise, 4-class, 1Hz, 8-28 m/s domain)
     """
 
     def __init__(self, threshold=S_THRESHOLD, device=None):
@@ -111,7 +100,7 @@ class DronePredictor:
 
     @staticmethod
     def compute_speed(hist):
-        """最近5帧平均速率 (m/s)"""
+        """Mean speed over last 5 frames (m/s)."""
         vel = hist[:, :, 3:6]
         speed = torch.norm(vel[:, -5:, :], dim=2).mean(dim=1)
         if speed.max() < 1e-6:
@@ -121,20 +110,15 @@ class DronePredictor:
 
     @staticmethod
     def compute_z_trend(hist, window=None):
-        """分析Z轴历史趋势, 判断无人机是否真的在下降。
+        """Analyze Z-axis history trend to judge whether the drone is descending.
 
         Args:
-            hist: (B, 20, 6) 历史轨迹
-            window: 分析窗口帧数 (默认用全部20帧)
+            hist: (B, 20, 6) history trajectory
+            window: number of frames to analyze (default: all 20)
 
         Returns:
-            dict with:
-                z_velocity: (B,) 最近window帧的Z轴平均速度 (m/s per frame), 负值=下降
-                z_accel:    (B,) Z轴加速度 (速度的变化率)
-                z_trend:    (B,) 线性回归斜率 (m/s²), 负值=加速下降
-                z_variance: (B,) Z位置的方差, 高值=波动大
-                is_descending: (B,) bool, 是否确认在下降
-                descent_strength: (B,) [0,1] 下降确信度
+            dict with z_velocity, z_accel, z_slope, z_variance,
+            is_descending (bool), descent_strength ([0,1]).
         """
         B = hist.shape[0]
         if window is None:
@@ -167,7 +151,7 @@ class DronePredictor:
         is_descending = (z_vel_mean < Z_TREND_DESCENT_THRESH) & (z_slope < 0)
 
         # Descent strength: normalized [0, 1] based on how negative the velocity is
-        # z_vel_mean = -0.03 → strength≈0, z_vel_mean = -0.5 → strength≈1
+        # z_vel_mean = -0.03 -> strength~0, z_vel_mean = -0.5 -> strength~1
         descent_strength = torch.clamp(-z_vel_mean / 0.5, 0.0, 1.0)  # (B,)
 
         return {
@@ -181,7 +165,7 @@ class DronePredictor:
 
     @torch.no_grad()
     def predict(self, hist):
-        """预测未来轨迹。
+        """Predict future trajectory.
 
         Args:
             hist: (B, 20, 6) [pos_x,pos_y,pos_z, vel_x,vel_y,vel_z] (meters, m/s)
@@ -201,37 +185,32 @@ class DronePredictor:
         hist = hist.to(self.device)
         speed = self.compute_speed(hist)
 
-        # 分别预测 (两个模型都运行, 用于软融合)
+        # Run both models (needed for soft fusion)
         out_low = self.low(hist, force_predict=True)
         out_high = self.high(hist, force_predict=True)
 
-        # Z轴纠正: 三段式过渡 + Z历史趋势感知
-        # descend_prob < 0.05 → 确信非下降, 强压制 (Z→5%)
-        # 0.05 <= descend_prob < 0.20 → 不确定区, 弱压制 (Z→30%)
-        # descend_prob >= 0.20 → 确信下降, 不压制 (Z→100%)
-        # Z历史趋势: 如果Z确实在下降 → 减弱压制 (模型判断更可信)
+        # Z correction: 3-segment transition + Z trend awareness
         if Z_CORRECTION_ENABLED:
             high_intent_prob = torch.softmax(out_high['intent_logits'], dim=-1)
             descend_prob = high_intent_prob[:, 3]               # class 3 = DESCEND
 
-            # 三段式dampen factor
+            # 3-segment dampen factor
             dampen = torch.full_like(descend_prob, 1.0)         # default: no dampening
             strong_mask = descend_prob < Z_DESCEND_THRESHOLD_LOW
             weak_mask = (descend_prob >= Z_DESCEND_THRESHOLD_LOW) & (descend_prob < Z_DESCEND_THRESHOLD_HIGH)
 
             if strong_mask.any():
-                dampen[strong_mask] = Z_DAMPEN_STRONG           # 5% → 强压制
+                dampen[strong_mask] = Z_DAMPEN_STRONG           # strong dampen
             if weak_mask.any():
-                # 线性过渡: 在[0.05, 0.20]区间内dampen从0.30线性过渡到1.0
+                # linear transition from 0.30 to 1.0 over [0.05, 0.20]
                 t = (descend_prob[weak_mask] - Z_DESCEND_THRESHOLD_LOW) / (Z_DESCEND_THRESHOLD_HIGH - Z_DESCEND_THRESHOLD_LOW)
                 dampen[weak_mask] = Z_DAMPEN_WEAK + (1.0 - Z_DAMPEN_WEAK) * t
 
-            # 多信号融合: Z趋势 + 模型不确定性 + 预测Z量级
-            # 每个信号独立判断"是否更像真下降", 满足则减弱压制
+            # Multi-signal fusion: Z trend + model uncertainty + predicted Z magnitude
             if Z_TREND_ENABLED or Z_UNCERTAINTY_ENABLED or Z_MAGNITUDE_ENABLED:
                 total_boost = torch.zeros_like(dampen)
 
-                # 信号1: Z历史趋势
+                # Signal 1: Z history trend
                 if Z_TREND_ENABLED:
                     z_info = self.compute_z_trend(hist, window=Z_TREND_WINDOW)
                     total_boost = total_boost + torch.where(
@@ -240,7 +219,7 @@ class DronePredictor:
                         torch.zeros_like(dampen)
                     )
 
-                # 信号2: 模型Z轴不确定性 (低不确定性 → 模型自信 → 减弱压制)
+                # Signal 2: model Z uncertainty (low uncertainty -> weaken dampen)
                 if Z_UNCERTAINTY_ENABLED:
                     z_logvar = out_high['uncertainty'][:, :, 2]  # (B, pred_len) Z axis
                     z_mean_logvar = z_logvar.mean(dim=1)  # (B,) average over pred steps
@@ -251,7 +230,7 @@ class DronePredictor:
                         torch.zeros_like(dampen)
                     )
 
-                # 信号3: 预测Z位移量级 (预测大负位移 → 更像真下降)
+                # Signal 3: predicted Z displacement magnitude
                 if Z_MAGNITUDE_ENABLED:
                     pred_z_final = out_high['predictions'][:, -1, 2]  # (B,) final Z pred
                     large_descent = pred_z_final < -Z_MAGNITUDE_THRESH
@@ -267,8 +246,7 @@ class DronePredictor:
             if apply_mask.any():
                 out_high['predictions'][apply_mask, :, 2] *= dampen[apply_mask].view(-1, 1)
 
-            # ── LOW Z轴纠正 (DESCEND=class 4, 6-class) ──
-            # LOW 模型同样受益于Z纠正: 低速无人机在DESCEND时也有Z漂移问题
+            # LOW Z correction (DESCEND = class 4, 6-class)
             low_intent_prob = torch.softmax(out_low['intent_logits'], dim=-1)
             low_descend_prob = low_intent_prob[:, 4]            # class 4 = DESCEND
 
@@ -282,7 +260,7 @@ class DronePredictor:
                 t_low = (low_descend_prob[low_weak] - Z_DESCEND_THRESHOLD_LOW) / (Z_DESCEND_THRESHOLD_HIGH - Z_DESCEND_THRESHOLD_LOW)
                 low_dampen[low_weak] = Z_DAMPEN_WEAK + (1.0 - Z_DAMPEN_WEAK) * t_low
 
-            # 多信号融合 for LOW (reuse same thresholds, LOW drones are slower so signals are more conservative)
+            # Multi-signal fusion for LOW (reuse same thresholds)
             if Z_TREND_ENABLED or Z_UNCERTAINTY_ENABLED or Z_MAGNITUDE_ENABLED:
                 low_boost = torch.zeros_like(low_dampen)
 
@@ -321,8 +299,7 @@ class DronePredictor:
             if low_apply.any():
                 out_low['predictions'][low_apply, :, 2] *= low_dampen[low_apply].view(-1, 1)
 
-        # 熵引导物理融合: LOW模型意图不确定时偏向物理外推
-        # 高熵(=模型在STRAIGHT/TURN之间纠结)时, 物理外推保留转弯动量, 比混乱的anchor更可靠
+        # Entropy-guided physics fusion: lean on physics when LOW intent is uncertain
         if ENTROPY_PHYSICS_ENABLED:
             low_intent_prob = torch.softmax(out_low['intent_logits'], dim=-1)
             low_entropy = -(low_intent_prob * torch.log(low_intent_prob + 1e-8)).sum(dim=-1)
@@ -333,33 +310,31 @@ class DronePredictor:
                     blend = alpha.view(-1, 1, 1)
                     out_low['predictions'] = (1.0 - blend) * out_low['predictions'] + blend * physics
 
-        # 软融合: sigmoid 平滑过渡替代硬切换
-        # α = sigmoid((speed - threshold) / temperature)
-        # 过渡区外: speed < threshold-width → α=0 (纯LOW), speed > threshold+width → α=1 (纯HIGH)
+        # Soft fusion: sigmoid transition instead of hard switch
         if SOFT_FUSION_ENABLED:
             raw_alpha = torch.sigmoid((speed - self.threshold) / FUSION_TEMPERATURE)  # (B,)
-            # 过渡区门控: 仅在 [threshold - half_width, threshold + half_width] 内混合
+            # gate: blend only within [threshold +/- half_width]
             in_transition = (speed > self.threshold - FUSION_HALF_WIDTH) & (speed < self.threshold + FUSION_HALF_WIDTH)
             alpha = torch.where(in_transition, raw_alpha, (speed >= self.threshold).float())
             alpha_3d = alpha.view(-1, 1, 1)
             alpha_2d = alpha.view(-1, 1)
             predictions = (1.0 - alpha_3d) * out_low['predictions'] + alpha_3d * out_high['predictions']
 
-            # 意图也软融合
+            # Soft-fuse intent too
             intent_high_6 = torch.full((hist.shape[0], 6), float('-inf'),
                                        device=self.device, dtype=out_high['intent_logits'].dtype)
             for c4, c6 in _C4_TO_C6.items():
                 intent_high_6[:, c6] = out_high['intent_logits'][:, c4]
             intent = (1.0 - alpha_2d) * out_low['intent_logits'] + alpha_2d * intent_high_6
 
-            # 统计 (用 α>0.5 作为路由标签)
+            # Stats (route label uses alpha > 0.5)
             use_high = alpha > 0.5
             self._stats['n'] += hist.shape[0]
             self._stats['low'] += (alpha <= 0.5).sum().item()
             self._stats['high'] += (alpha > 0.5).sum().item()
             route_list = ['HIGH' if h else 'LOW' for h in use_high.cpu().tolist()]
         else:
-            # 原始硬切换 (向后兼容)
+            # Legacy hard switch (backward compatible)
             use_high = speed >= self.threshold  # (B,) bool
             mask_low = (~use_high).float().view(-1, 1, 1)
             mask_high = use_high.float().view(-1, 1, 1)
@@ -497,7 +472,7 @@ class DronePredictor:
             out_low = self.low(hist, force_predict=True)
             out_high = self.high(hist, force_predict=True)
 
-            # Z轴纠正: 三段式过渡 + Z历史趋势感知
+            # Z correction: 3-segment transition + Z trend awareness
             if Z_CORRECTION_ENABLED:
                 high_intent_prob = torch.softmax(out_high['intent_logits'], dim=-1)
                 descend_prob = high_intent_prob[:, 3]
@@ -512,7 +487,7 @@ class DronePredictor:
                     t = (descend_prob[weak_mask] - Z_DESCEND_THRESHOLD_LOW) / (Z_DESCEND_THRESHOLD_HIGH - Z_DESCEND_THRESHOLD_LOW)
                     dampen[weak_mask] = Z_DAMPEN_WEAK + (1.0 - Z_DAMPEN_WEAK) * t
 
-                # 多信号融合: Z趋势 + 模型不确定性 + 预测Z量级
+                # Multi-signal fusion: Z trend + model uncertainty + predicted Z magnitude
                 if Z_TREND_ENABLED or Z_UNCERTAINTY_ENABLED or Z_MAGNITUDE_ENABLED:
                     total_boost = torch.zeros_like(dampen)
 
@@ -549,7 +524,7 @@ class DronePredictor:
                 if apply_mask.any():
                     out_high['predictions'][apply_mask, :, 2] *= dampen[apply_mask].view(-1, 1)
 
-                # ── LOW Z轴纠正 (DESCEND=class 4 in 6-class) ──
+                # LOW Z correction (DESCEND = class 4 in 6-class)
                 low_intent_prob = torch.softmax(out_low['intent_logits'], dim=-1)
                 low_descend_prob = low_intent_prob[:, 4]
 
@@ -600,7 +575,7 @@ class DronePredictor:
                 if low_apply.any():
                     out_low['predictions'][low_apply, :, 2] *= low_dampen[low_apply].view(-1, 1)
 
-            # 熵引导物理融合
+            # Entropy-guided physics fusion
             if ENTROPY_PHYSICS_ENABLED:
                 low_intent_prob = torch.softmax(out_low['intent_logits'], dim=-1)
                 low_entropy = -(low_intent_prob * torch.log(low_intent_prob + 1e-8)).sum(dim=-1)
@@ -614,7 +589,7 @@ class DronePredictor:
             if adapted:
                 self._adapter_mgr.deactivate()
 
-            # 软融合 or 硬切换
+            # Soft fusion or hard switch
             if SOFT_FUSION_ENABLED:
                 raw_alpha = torch.sigmoid((speed - self.threshold) / FUSION_TEMPERATURE)
                 in_transition = (speed > self.threshold - FUSION_HALF_WIDTH) & (speed < self.threshold + FUSION_HALF_WIDTH)
@@ -699,14 +674,14 @@ if __name__ == '__main__':
     p = DronePredictor()
     print(f'Loaded: {p.loaded_models}')
 
-    # 低速
+    # Low speed
     x_low = torch.randn(4, 20, 6)
     x_low[:, :, 3:6] *= 0.5
     out = p.predict(x_low)
     routes = out['route']
     print(f'Low speed (~0.5 m/s): route={[r for r in routes]}')
 
-    # 高速
+    # High speed
     x_high = torch.randn(4, 20, 6)
     x_high[:, :, 3:6] *= 12.0
     out = p.predict(x_high)

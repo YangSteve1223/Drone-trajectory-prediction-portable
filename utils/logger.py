@@ -1,18 +1,4 @@
-"""
-训练日志与可视化模块.
-
-功能:
-  1. 每 epoch 记录 loss/指标到 JSON
-  2. 自动绘制 Loss 曲线
-  3. 收敛判断 (patience-based early stopping 建议)
-  4. 最佳 epoch 标记
-
-用法:
-    logger = TrainingLogger(log_dir='./runs/my_exp')
-    logger.log_epoch(epoch, train_loss, val_metrics)
-    logger.plot_curves()         # 绘制并保存曲线
-    logger.check_convergence()   # 判断是否收敛
-"""
+"""Training logger and visualization: per-epoch metrics to JSON, loss curves, convergence check."""
 
 import json
 import os
@@ -22,14 +8,14 @@ import numpy as np
 
 
 class TrainingLogger:
-    """训练日志管理器."""
+    """Training log manager."""
 
     def __init__(
         self,
         log_dir: str = './runs/default',
-        patience: int = 15,           # 收敛判断: 连续 N epoch 无改善则建议停止
-        min_delta: float = 0.001,     # 最小改善阈值 (相对变化)
-        smoothing_window: int = 5,    # 曲线平滑窗口
+        patience: int = 15,           # convergence: suggest stop after N epochs without improvement
+        min_delta: float = 0.001,     # min relative improvement threshold
+        smoothing_window: int = 5,    # curve smoothing window
     ):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -39,15 +25,15 @@ class TrainingLogger:
         self.min_delta = min_delta
         self.smoothing_window = smoothing_window
 
-        # 日志记录
+        # Log records
         self.history: List[Dict] = []
 
-        # 收敛追踪
+        # Convergence tracking
         self.best_val_rmse = float('inf')
         self.best_epoch = 0
         self.epochs_without_improvement = 0
 
-        # 尝试加载已有记录 (resume)
+        # Try to load existing log (resume)
         if self.json_path.exists():
             try:
                 with open(self.json_path, 'r') as f:
@@ -77,14 +63,14 @@ class TrainingLogger:
         lr: Optional[float] = None,
     ):
         """
-        记录一个 epoch 的指标.
+        Log metrics for one epoch.
 
         Args:
-            epoch: epoch 编号
-            train_loss: 总训练损失
-            train_breakdown: 训练损失分解 {'displacement': ..., 'intent': ..., ...}
-            val_metrics: 验证指标 (可选) {'RMSE': ..., 'Distance_Accuracy': ..., ...}
-            lr: 当前学习率 (可选)
+            epoch: epoch number
+            train_loss: total training loss
+            train_breakdown: loss breakdown {'displacement': ..., 'intent': ..., ...}
+            val_metrics: validation metrics (optional) {'RMSE': ..., 'Distance_Accuracy': ..., ...}
+            lr: current learning rate (optional)
         """
         entry = {
             'epoch': epoch,
@@ -106,9 +92,9 @@ class TrainingLogger:
             entry['val_mean_jerk'] = float(val_metrics.get('Mean_Jerk', float('nan')))
             entry['val_loss'] = float(val_metrics.get('val_loss', float('nan')))
 
-            # 更新收敛追踪
+            # Update convergence tracking
             current_rmse = entry['val_rmse']
-            # 处理初始状态 (best_val_rmse = inf)
+            # Handle initial state (best_val_rmse = inf)
             if self.best_val_rmse == float('inf') or np.isinf(self.best_val_rmse):
                 improvement = 1.0  # first validation always an improvement
             else:
@@ -126,13 +112,13 @@ class TrainingLogger:
         self._save_json()
 
     def _save_json(self):
-        """保存日志到 JSON 文件."""
+        """Save log to JSON file."""
         with open(self.json_path, 'w') as f:
             json.dump(self.history, f, indent=2, ensure_ascii=False)
 
     def check_convergence(self) -> Dict:
         """
-        检查训练是否收敛.
+        Check whether training has converged.
 
         Returns:
             dict with:
@@ -145,13 +131,13 @@ class TrainingLogger:
         if len(self.history) < 10:
             return {
                 'converged': False,
-                'message': f'仅 {len(self.history)} epochs, 至少需要 10 epochs',
+                'message': f'only {len(self.history)} epochs, need at least 10',
                 'best_epoch': self.best_epoch if self.best_val_rmse != float('inf') else -1,
                 'best_rmse': self.best_val_rmse,
-                'suggestion': '继续训练'
+                'suggestion': 'keep training'
             }
 
-        # 无验证数据时只检查训练损失趋势
+        # Only check training loss trend when no validation data
         has_val = any('val_rmse' in e for e in self.history)
         if not has_val:
             recent = self.history[-10:]
@@ -161,17 +147,17 @@ class TrainingLogger:
                 if trend < 0.001:
                     return {
                         'converged': True,
-                        'message': '训练损失已趋于平稳',
+                        'message': 'training loss has plateaued',
                         'best_epoch': -1,
                         'best_rmse': float('inf'),
-                        'suggestion': '建议添加验证集或继续观察'
+                        'suggestion': 'add a validation set or keep observing'
                     }
             return {
                 'converged': False,
-                'message': '无验证数据, 仅观察训练损失',
+                'message': 'no validation data, tracking train loss only',
                 'best_epoch': -1,
                 'best_rmse': float('inf'),
-                'suggestion': '继续训练'
+                'suggestion': 'keep training'
             }
 
         recent = self.history[-self.patience:]
@@ -180,13 +166,13 @@ class TrainingLogger:
         if len(recent_losses) < self.patience // 2:
             return {
                 'converged': False,
-                'message': '验证数据不足',
+                'message': 'insufficient validation data',
                 'best_epoch': self.best_epoch,
                 'best_rmse': self.best_val_rmse,
-                'suggestion': '继续训练, 等待更多验证点'
+                'suggestion': 'keep training for more validation points'
             }
 
-        # 判断训练损失趋势
+        # Check training loss trend
         if len(recent_losses) >= 5:
             first_half = np.mean(recent_losses[:len(recent_losses) // 2])
             second_half = np.mean(recent_losses[len(recent_losses) // 2:])
@@ -197,33 +183,33 @@ class TrainingLogger:
         if self.epochs_without_improvement >= self.patience:
             return {
                 'converged': True,
-                'message': f'验证 RMSE 已 {self.epochs_without_improvement} epochs 无改善',
+                'message': f'val RMSE has not improved for {self.epochs_without_improvement} epochs',
                 'best_epoch': self.best_epoch,
                 'best_rmse': self.best_val_rmse,
-                'suggestion': f'建议停止训练, 使用 epoch {self.best_epoch} 的权重 (RMSE={self.best_val_rmse:.4f})'
+                'suggestion': f'stop training, use epoch {self.best_epoch} weights (RMSE={self.best_val_rmse:.4f})'
             }
         elif self.epochs_without_improvement >= self.patience * 0.6:
             return {
                 'converged': False,
-                'message': f'接近收敛 ({self.epochs_without_improvement}/{self.patience} epochs 无改善)',
+                'message': f'near convergence ({self.epochs_without_improvement}/{self.patience} epochs no improvement)',
                 'best_epoch': self.best_epoch,
                 'best_rmse': self.best_val_rmse,
-                'suggestion': '可能即将收敛, 再观察几个 epoch'
+                'suggestion': 'may converge soon, observe a few more epochs'
             }
         else:
             return {
                 'converged': False,
-                'message': '仍在改善中' if loss_trend > 0.01 else '损失仍在改善',
+                'message': 'still improving',
                 'best_epoch': self.best_epoch,
                 'best_rmse': self.best_val_rmse,
-                'suggestion': '继续训练'
+                'suggestion': 'keep training'
             }
 
     def plot_curves(self, save_path: Optional[str] = None):
         """
-        绘制训练曲线并保存.
+        Plot and save training curves.
 
-        生成 4 个子图:
+        Generates 4 subplots:
           1. Train Loss (total + breakdown)
           2. Validation RMSE + Distance Accuracy
           3. Validation Direction Accuracy + Intent Accuracy
@@ -231,7 +217,7 @@ class TrainingLogger:
         """
         try:
             import matplotlib
-            matplotlib.use('Agg')  # 非交互式后端
+            matplotlib.use('Agg')  # non-interactive backend
             import matplotlib.pyplot as plt
             # Fix CJK font: use a font that supports ASCII at minimum
             matplotlib.rcParams['font.family'] = 'sans-serif'
@@ -332,22 +318,9 @@ class TrainingLogger:
         else:
             ax.text(0.5, 0.5, 'No LR data', ha='center', va='center', transform=ax.transAxes)
 
-        # Convergence annotation (English for font compatibility)
+        # Convergence annotation
         conv = self.check_convergence()
-        conv_msg = conv.get('message', '')
-        # Map Chinese messages to English for plot
-        if '仅' in conv_msg:
-            conv_label = f'{len(self.history)} epochs, need >= 10'
-        elif '接近收敛' in conv_msg:
-            conv_label = 'Near convergence'
-        elif '仍在改善' in conv_msg:
-            conv_label = 'Still improving'
-        elif '验证 RMSE 已' in conv_msg:
-            conv_label = f'No improvement for {self.epochs_without_improvement} epochs'
-        elif '数据不足' in conv_msg:
-            conv_label = 'Insufficient val data'
-        else:
-            conv_label = conv_msg
+        conv_label = conv.get('message', '')
         ax.set_xlabel('Epoch')
         ax.set_title(f'LR Schedule | {conv_label}')
         ax.grid(True, alpha=0.3)
@@ -360,14 +333,14 @@ class TrainingLogger:
         print(f"[Logger] Curves saved to {save_path}")
 
     def _smooth(self, values: List[float]) -> np.ndarray:
-        """滑动平均平滑."""
+        """Moving-average smoothing."""
         if len(values) < self.smoothing_window:
             return np.array(values)
         kernel = np.ones(self.smoothing_window) / self.smoothing_window
         return np.convolve(values, kernel, mode='same')
 
     def get_summary(self) -> Dict:
-        """获取训练摘要."""
+        """Get training summary."""
         if not self.history:
             return {'status': 'no data'}
 

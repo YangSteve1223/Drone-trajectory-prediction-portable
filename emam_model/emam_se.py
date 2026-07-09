@@ -47,14 +47,14 @@ class GRLU(nn.Module):
 
 class SelectiveSSM(nn.Module):
     """
-    Selective State Space Model (Mamba variant)
-    
-    实现输入依赖的选择性状态空间扫描:
-        h_t = exp(dt_t * A) * h_{t-1} + B_t * x_t   (状态更新)
-        y_t = C_t * h_t + D * x_t                    (输出投影)
-    
-    其中 dt_t 由输入 x_t 经 softplus 计算得到，使 A 矩阵离散化参数
-    每步不同，从而赋予模型对序列内容的选择性注意能力。
+    Selective State Space Model (Mamba variant).
+
+    Input-dependent selective scan:
+        h_t = exp(dt_t * A) * h_{t-1} + B_t * x_t   (state update)
+        y_t = C_t * h_t + D * x_t                    (output projection)
+
+    dt_t is computed from x_t via softplus, making the discretization
+    step input-dependent for content-selective attention.
     """
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
@@ -63,8 +63,7 @@ class SelectiveSSM(nn.Module):
         self.d_inner = int(expand * d_model)
 
         self.in_proj = nn.Linear(d_model, self.d_inner * 3, bias=False)
-        # A 使用 log-space 参数化: A = -exp(A_log)，保证始终为负
-        # 负 A 使 SSM 状态自然衰减 (exp(dt * (-|A|)) < 1)，防止递归爆炸
+        # A in log-space: A = -exp(A_log), always negative so SSM state decays
         self.A_log = nn.Parameter(torch.randn(self.d_inner, d_state))
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
@@ -77,8 +76,7 @@ class SelectiveSSM(nn.Module):
         self._init()
 
     def _init(self):
-        # A_log 初始化为使 A 在 [-2, -0.1] 范围内 (不同通道不同衰减速率)
-        # 均值为 -0.5: A_log ~ N(ln(0.5), small_std)
+        # Init A_log so A in [-2, -0.1], mean ~ -0.5
         nn.init.normal_(self.A_log, mean=-0.7, std=0.5)  # A ≈ -exp(-0.7) ≈ -0.5
         nn.init.ones_(self.D)
         nn.init.kaiming_normal_(self.conv1d.weight, mode='fan_in', nonlinearity='relu')
@@ -88,18 +86,18 @@ class SelectiveSSM(nn.Module):
         B, T, D = x.shape
         d_inner = self.d_inner
 
-        # 输入投影: x → [x_gate, x_dt_raw, x_inner]
+        # Input projection: x → [x_gate, x_dt_raw, x_inner]
         xz = self.in_proj(x)
         x_gate, x_dt_raw, x_inner = xz.chunk(3, dim=-1)
 
-        # 因果卷积 (保持时间顺序)
+        # Causal conv (preserve time order)
         x_conv = x_inner.transpose(1, 2)
         x_conv = self.conv1d(x_conv)[:, :, :T]
         x_conv = x_conv.transpose(1, 2)
         x_act = silu(x_conv)  # (B, T, d_inner)
 
-        # 时间增量: softplus 确保正值, 加偏置使初始 dt ≈ 1.0
-        # NOTE: 在 autocast 下 softplus 可能降为 FP16, 需要保持 FP32
+        # Time delta: softplus for positive value, bias makes initial dt ≈ 1.0
+        # NOTE: softplus may downcast to FP16 under autocast, keep FP32
         with torch.amp.autocast('cuda', enabled=False):
             if x_dt_raw.dtype == torch.float16:
                 x_dt_raw_fp32 = x_dt_raw.float()
@@ -107,11 +105,11 @@ class SelectiveSSM(nn.Module):
                 x_dt_raw_fp32 = x_dt_raw
             dt = F.softplus(x_dt_raw_fp32 + 1.0)
 
-        # === 选择性 SSM 递归扫描 ===
+        # === Selective SSM recurrent scan ===
         # CRITICAL: SSM scan uses torch.exp which overflows in FP16.
         # Force FP32 for numerical stability.
-        # A = -exp(A_log) 保证始终为负，防止递归状态爆炸
-        A_neg = -torch.exp(self.A_log)  # (d_inner, d_state), 所有值 < 0
+        # A = -exp(A_log), always negative to prevent state explosion
+        A_neg = -torch.exp(self.A_log)  # (d_inner, d_state), all < 0
         if _HAS_MAMBA_SSM and x.is_cuda:
             y = selective_scan_fn(
                 x_act, dt, A_neg, self.D.unsqueeze(-1),
@@ -136,7 +134,7 @@ class SelectiveSSM(nn.Module):
             if x.dtype == torch.float16:
                 y = y.half()
 
-        # 门控: z ⊙ y  (Mamba 的 gating 机制)
+        # Gating: z ⊙ y  (Mamba gating)
         gate = torch.sigmoid(x_gate)
         y = y * gate
 
@@ -192,26 +190,26 @@ class MultiScaleDWConv1D(nn.Module):
 
 def _selective_ssm_scan(
     x_act,      # (B, T, d_inner)
-    dt,         # (B, T, d_inner)  softplus 输出, 始终 > 0
-    A_mat,      # (d_inner, d_state)  -exp(A_log), 始终 < 0
+    dt,         # (B, T, d_inner)  softplus output, always > 0
+    A_mat,      # (d_inner, d_state)  -exp(A_log), always < 0
     D_vec,      # (d_inner,)
     d_state,
 ):
-    """选择性 SSM 递归扫描 (eager mode, pre-allocated output).
+    """Selective SSM recurrent scan (eager mode, pre-allocated output).
 
-    A < 0 保证 exp(dt * A) ≤ 1，状态自然衰减，不会爆炸。
+    A < 0 ensures exp(dt * A) <= 1, so state decays without exploding.
     """
     B, T, d_inner = x_act.shape
     device = x_act.device
     h = torch.zeros(B, d_inner, d_state, device=device, dtype=torch.float32)
     output = torch.empty(B, T, d_inner, device=device, dtype=torch.float32)
 
-    # dt 由 softplus 输出，理论上 > 0；额外 clamp 防止异常值
+    # dt from softplus is > 0; extra clamp guards against outliers
     dt = dt.clamp(min=1e-6, max=50.0)
 
-    # 预分配中间 tensor，避免每次循环分配 (减少 autograd 跟踪的中间节点)
-    D_vec_b = D_vec.view(1, d_inner)  # (1, d_inner) 广播视图
-    A_mat_b = A_mat.unsqueeze(0)       # (1, d_inner, d_state) 广播视图
+    # Pre-allocate broadcast views to reduce autograd intermediates
+    D_vec_b = D_vec.view(1, d_inner)  # (1, d_inner) broadcast view
+    A_mat_b = A_mat.unsqueeze(0)       # (1, d_inner, d_state) broadcast view
 
     for t in range(T):
         dt_t = dt[:, t, :]                                          # (B, d_inner)
@@ -219,7 +217,7 @@ def _selective_ssm_scan(
         log_A_d = (dt_t.unsqueeze(-1) * A_mat_b).clamp_(-50.0, 50.0)
         A_d = torch.exp(log_A_d)                                     # (B, d_inner, d_state)
         x_t = x_act[:, t, :]
-        # in-place 更新: h = A_d ⊙ h + x_t   (广播: x_t → (B, d_inner, 1))
+        # in-place update: h = A_d ⊙ h + x_t  (broadcast: x_t → (B, d_inner, 1))
         h.mul_(A_d).add_(x_t.unsqueeze(-1))
         output[:, t, :] = h.sum(dim=-1) + D_vec_b * x_t
     return output

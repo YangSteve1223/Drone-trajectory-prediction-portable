@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-从 UAV-Flow parquet 文件中提取轨迹数据，转换为统一格式供后续预处理。
+"""Extract trajectory data from UAV-Flow parquet files into a unified format.
 
 UAV-Flow parquet schema:
   id:        string      — trajectory timestamp ID
@@ -13,13 +12,13 @@ UAV-Flow parquet schema:
       instruction_unified: str — standardized instruction
   }
 
-输出: 每个轨迹一个 .npz 文件，包含:
-  traj:      (T, 6) float32  [x, y, z, vx, vy, vz]  (centered, in meters & m/s)
+Output: one .npz per trajectory with:
+  traj:      (T, 6) float32  [x, y, z, vx, vy, vz]  (centered, meters & m/s)
   timestamp: (T,)  float64   Unix timestamps
-  instruction: str           自然语言指令
-  traj_id:    str            轨迹 ID
+  instruction: str
+  traj_id:    str
 
-用法:
+Usage:
   python extract_uavflow.py --data_dir ./UAV-Flow-data --out_dir ./UAV-Flow-trajs
   python extract_uavflow.py --data_dir ./UAV-Flow-data --out_dir ./UAV-Flow-trajs --max_files 5
 """
@@ -34,17 +33,16 @@ import sys
 
 
 def parse_raw_logs(raw_logs):
-    """
-    将 raw_logs 列表转换为轨迹数组。
+    """Convert raw_logs list to trajectory array.
 
-    raw_logs 每帧 7 个字段:
+    raw_logs fields per frame (7):
       0: pos_x    — UTM easting (m)
       1: pos_y    — UTM northing (m)
-      2: altitude — 高度 (m)
-      3: roll     — 滚转角 (deg)
-      4: heading  — 偏航角 (deg, 0=North, 90=East)
-      5: pitch    — 俯仰角 (deg, 负=前倾)
-      6: timestamp — Unix 时间戳 (s)
+      2: altitude — (m)
+      3: roll     — (deg)
+      4: heading  — yaw (deg, 0=North, 90=East)
+      5: pitch    — (deg, negative=nose down)
+      6: timestamp — Unix time (s)
 
     Returns:
       traj: (T, 6) float32  [x, y, z, vx, vy, vz] centered on first frame
@@ -53,20 +51,20 @@ def parse_raw_logs(raw_logs):
     raw = np.array(raw_logs, dtype=np.float64)  # (T, 7)
     T = raw.shape[0]
 
-    # 提取 position (centered on first frame)
+    # Position (centered on first frame)
     pos = raw[:, 0:3].copy()                    # (T, 3)
     pos0 = pos[0:1, :]                          # (1, 3) first frame
     pos_centered = pos - pos0                   # (T, 3) relative to start
 
-    # 提取 timestamps
+    # Timestamps
     timestamps = raw[:, 6].copy()
 
-    # 计算速度 (中心差分, 边界用单侧)
+    # Velocity (central difference, one-sided at boundaries)
     dt = np.diff(timestamps)                    # (T-1,)
-    dt = np.maximum(dt, 1e-6)                   # 防止除零
+    dt = np.maximum(dt, 1e-6)                   # avoid div-by-zero
     vel = np.zeros((T, 3), dtype=np.float64)
 
-    # 中心差分 (内部点)
+    # Central difference (interior points)
     if T >= 3:
         dt_center = (timestamps[2:] - timestamps[:-2])  # (T-2,)
         dt_center = np.maximum(dt_center, 1e-6)
@@ -74,31 +72,30 @@ def parse_raw_logs(raw_logs):
         vel[1:-1, 1] = (pos[2:, 1] - pos[:-2, 1]) / dt_center
         vel[1:-1, 2] = (pos[2:, 2] - pos[:-2, 2]) / dt_center
 
-    # 边界: 前向/后向差分
+    # Boundary: forward/backward difference
     vel[0, :] = (pos[1, :] - pos[0, :]) / dt[0]
     vel[-1, :] = (pos[-1, :] - pos[-2, :]) / dt[-1]
 
-    # 合并为 (T, 6): [x, y, z, vx, vy, vz]
+    # Combine into (T, 6): [x, y, z, vx, vy, vz]
     traj = np.concatenate([pos_centered, vel], axis=1).astype(np.float32)
 
     return traj, timestamps
 
 
 def extract_file(parquet_path: Path, out_dir: Path, stats: dict):
-    """
-    从单个 parquet 文件提取所有轨迹。
+    """Extract all trajectories from a single parquet file.
 
-    关键: 同一个 trajectory ID 在表中重复多次（每帧一行），
-    log 列包含完整轨迹的 JSON，所以只需每个 ID 取第一行即可。
+    Note: each trajectory ID repeats (one row per frame), but the log column
+    holds the full trajectory JSON, so only the first row per ID is needed.
     """
     pf = pq.ParquetFile(str(parquet_path))
-    # 只读 id 和 log 列, 跳过嵌套的 image 列
+    # Read only id and log columns, skip nested image column
     table = pf.read(columns=['id', 'log'])
 
     ids = table.column('id').to_pylist()
     logs = table.column('log').to_pylist()
 
-    # 去重: 每个 trajectory ID 只处理一次
+    # Dedup: process each trajectory ID once
     seen = set()
     n_extracted = 0
 
@@ -114,7 +111,7 @@ def extract_file(parquet_path: Path, out_dir: Path, stats: dict):
             continue
 
         raw_logs = log_data.get('raw_logs')
-        if not raw_logs or len(raw_logs) < 5:  # 至少5帧才有意义
+        if not raw_logs or len(raw_logs) < 5:  # need at least 5 frames
             stats['too_short'] += 1
             continue
 
@@ -124,13 +121,13 @@ def extract_file(parquet_path: Path, out_dir: Path, stats: dict):
             stats['parse_errors'] += 1
             continue
 
-        # 过滤异常轨迹: 位置跳跃过大 (>100m/s 的瞬时速度)
+        # Filter anomalous trajectories (instant speed >100 m/s)
         max_speed = np.max(np.linalg.norm(traj[:, 3:6], axis=1))
         if max_speed > 100:
             stats['anomalous'] += 1
             continue
 
-        # 保存
+        # Save
         instruction = log_data.get('instruction', '')
         safe_id = tid.replace(':', '-').replace('/', '-').replace('\\', '-')
         out_path = out_dir / f'{safe_id}.npz'

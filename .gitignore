@@ -15,3 +15,7 @@ checkpoints/*/
 # OS
 .DS_Store
 Thumbs.db
+reviewtodelete/
+_low_*.npz
+checkpoints/
+train/dataset/

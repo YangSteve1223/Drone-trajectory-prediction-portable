@@ -1,6 +1,6 @@
 """
-完整轨迹预测模型: TrajectoryPredictor
-EMam-SE + IA-DTP + UA-PGD 三模块串联
+Full trajectory prediction model: TrajectoryPredictor
+EMam-SE + IA-DTP + UA-PGD chained together.
 """
 
 import torch
@@ -16,21 +16,21 @@ from .trigger import EventDrivenTrigger, SimpleTrigger, FunnelTrigger
 
 class TrajectoryPredictor(nn.Module):
     """
-    完整轨迹预测模型
+    Full trajectory prediction model.
 
-    流程:
-    Input Trajectory → EMam-SE → IA-DTP → UA-PGD → 3D Displacement Prediction
+    Flow:
+    Input Trajectory -> EMam-SE -> IA-DTP -> UA-PGD -> 3D Displacement Prediction
 
-    可选集成:
-    - 事件驱动触发器 (Event-Driven Trigger)
-    - 不确定性量化输出
+    Optional:
+    - Event-driven trigger
+    - Uncertainty quantification output
     """
     def __init__(
         self,
-        # 输入配置
+        # Input config
         input_dim: int = 6,           # [x, y, z, vx, vy, vz]
-        history_len: int = 20,        # 历史轨迹帧数
-        pred_len: int = 20,           # 预测帧数
+        history_len: int = 20,        # history trajectory frames
+        pred_len: int = 20,           # prediction frames
         # EMam-SE
         d_model: int = 256,
         d_state: int = 16,
@@ -41,11 +41,11 @@ class TrajectoryPredictor(nn.Module):
         # IA-DTP
         num_intent_classes: int = NUM_INTENT_CLASSES,
         intent_hidden: int = 128,
-        # 触发器
+        # Trigger
         use_trigger: bool = True,
         trigger_mode: str = 'funnel',    # 'simple' | 'funnel' | 'learned'
         trigger_threshold: float = 0.5,
-        # 损失权重
+        # Loss weights
         loss_weights: Dict[str, float] = None,
     ):
         super().__init__()
@@ -58,7 +58,7 @@ class TrajectoryPredictor(nn.Module):
             loss_weights = {'displacement': 1.0, 'intent': 0.1, 'uncertainty': 0.05}
         self.loss_weights = loss_weights
 
-        # === 核心三模块 ===
+        # === Core three modules ===
         self.emam_se = EnhancedMambaSE(
             input_dim=input_dim,
             d_model=d_model,
@@ -83,7 +83,7 @@ class TrajectoryPredictor(nn.Module):
             dropout=dropout
         )
 
-        # === 触发器 ===
+        # === Trigger ===
         if use_trigger:
             if trigger_mode == 'funnel':
                 self.trigger = FunnelTrigger(
@@ -106,7 +106,7 @@ class TrajectoryPredictor(nn.Module):
             self.trigger = None
             self._trigger_mode = 'none'
 
-        # === 历史意图缓冲区 ===
+        # === Intent history buffer ===
         self.register_buffer('intent_history', torch.zeros(history_len, num_intent_classes))
 
         # Internal normalization control (set False for external dynamic norm)
@@ -121,21 +121,21 @@ class TrajectoryPredictor(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            history: (B, T, input_dim) 历史轨迹
-            intent_labels: (B,) 可选, 意图类别标签
-            return_all: 是否返回中间结果
-            force_predict: 强制预测 (绕过触发器)
+            history: (B, T, input_dim) history trajectory
+            intent_labels: (B,) optional intent class labels
+            return_all: whether to return intermediate results
+            force_predict: force prediction (bypass trigger)
         Returns:
             dict:
-                predictions: (B, pred_len, 3) 未来3D位移
-                intent_logits: (B, num_classes) 意图logits
-                intent_weights: (B, num_classes) 意图权重
-                trigger_decision: (B,) bool, 是否触发
-                uncertainty: (B, pred_len, 3) 不确定性
+                predictions: (B, pred_len, 3) future 3D displacement
+                intent_logits: (B, num_classes) intent logits
+                intent_weights: (B, num_classes) intent weights
+                trigger_decision: (B,) bool, whether triggered
+                uncertainty: (B, pred_len, 3) uncertainty
         """
         B, T, C = history.shape
 
-        # === Step 0: 输入归一化 ===
+        # === Step 0: input normalization ===
         if getattr(self, '_norm_input', True):
             # Fixed global normalization (backward compatible)
             _scale_pos = 100.0
@@ -149,17 +149,17 @@ class TrajectoryPredictor(nn.Module):
             _scale_vel = 1.0
             h = history
 
-        # === Step 1: EMam-SE 编码 ===
+        # === Step 1: EMam-SE encode ===
         encoded = self.emam_se(h)  # (B, T, d_model)
 
-        # === Step 2: IA-DTP 意图感知 ===
+        # === Step 2: IA-DTP intent awareness ===
         dtp_out = self.ia_dtp(encoded, historical_trajectory=h)
         global_anchor = dtp_out['global_anchor']       # (B,1,d_model)
         intent_logits = dtp_out['intent_logits']        # (B,num_classes)
         intent_weights = dtp_out['intent_weights']      # (B,num_classes)
         enhanced_features = dtp_out['enhanced_features']  # (B,T,d_model)
 
-        # === Step 3: 触发器决策 (用归一化轨迹) ===
+        # === Step 3: trigger decision (uses normalized trajectory) ===
         trigger_out = None
         if self.trigger is not None and not force_predict:
             trigger_out = self.trigger(
@@ -171,7 +171,7 @@ class TrajectoryPredictor(nn.Module):
         else:
             trigger_decision = torch.ones(B, dtype=torch.bool, device=h.device)
 
-        # === Step 4: UA-PGD 解码 ===
+        # === Step 4: UA-PGD decode ===
         pgd_out = self.ua_pgd(
             encoded_feat=encoded,
             global_anchor=global_anchor,
@@ -179,16 +179,16 @@ class TrajectoryPredictor(nn.Module):
             intent_weights=intent_weights,
             return_uncertainty=True
         )
-        predictions = pgd_out['predictions']            # (B, pred_len, 3) — 归一化空间
+        predictions = pgd_out['predictions']            # (B, pred_len, 3) — normalized space
         uncertainties = pgd_out['logvar']
         physics_trajectory = pgd_out.get('physics_trajectory',
                                          torch.zeros(B, self.pred_len, 3, device=h.device))
         gate_inertia = pgd_out.get('gate_inertia',
                                    torch.zeros(B, self.pred_len, device=h.device))
 
-        # 未触发目标: 匀速基线 (归一化空间)
+        # Untriggered targets: constant-velocity baseline (normalized space)
         if not force_predict and (self.trigger is not None):
-            last_vel = h[:, -1, 3:6]                               # (B, 3) 归一化速度
+            last_vel = h[:, -1, 3:6]                               # (B, 3) normalized velocity
             vel_recent = h[:, -3:, 3:6]                            # (B, 3, 3)
             w = torch.tensor([0.2, 0.3, 0.5], device=h.device)
             last_vel_smooth = (vel_recent * w.view(1, 3, 1)).sum(dim=1)
@@ -198,11 +198,11 @@ class TrajectoryPredictor(nn.Module):
             mask = trigger_decision.float().unsqueeze(-1).unsqueeze(-1)
             predictions = predictions * mask + baseline * (1 - mask)
 
-        # === Step 5: 逆归一化 — 位置位移缩回原始坐标 ===
+        # === Step 5: denormalize — scale displacement back to original coords ===
         predictions = predictions * _scale_pos
         physics_trajectory = physics_trajectory * _scale_pos
 
-        # 更新意图历史缓冲区 (防止 NaN 污染持久状态)
+        # Update intent history buffer (avoid NaN polluting persistent state)
         if self.training:
             latest_intent = intent_weights.detach().mean(dim=0)  # (num_classes,)
             if torch.isfinite(latest_intent).all():
@@ -232,47 +232,46 @@ class TrajectoryPredictor(nn.Module):
 
     def compute_loss(
         self,
-        predictions: torch.Tensor,       # (B, pred_len, 3) 预测位移
+        predictions: torch.Tensor,       # (B, pred_len, 3) predicted displacement
         uncertainty: torch.Tensor,        # (B, pred_len, 3) logvar
-        targets: torch.Tensor,            # (B, pred_len, 3) 真值位移
+        targets: torch.Tensor,            # (B, pred_len, 3) ground-truth displacement
         intent_logits: torch.Tensor,      # (B, num_classes)
         intent_labels: torch.Tensor,       # (B,)
         intent_weights: torch.Tensor = None,
-        physics_trajectory: torch.Tensor = None,  # (B, pred_len, 3) 物理外推轨迹
-        gate_inertia: torch.Tensor = None,        # (B, pred_len)     惯性门控
+        physics_trajectory: torch.Tensor = None,  # (B, pred_len, 3) physics extrapolation
+        gate_inertia: torch.Tensor = None,        # (B, pred_len)     inertia gate
     ) -> Dict[str, torch.Tensor]:
         """
-        计算总损失 = 位移损失 + 意图损失 + 不确定性损失 + 物理一致性损失（可选）
+        Total loss = displacement + intent + uncertainty + physics consistency (optional).
 
         Args:
-            physics_trajectory: 物理模型外推轨迹，若为None则跳过物理损失
-            gate_inertia:      惯性门控值，若为None则跳过物理损失
+            physics_trajectory: physics-model extrapolation; if None, skip physics loss
+            gate_inertia:      inertia gate values; if None, skip physics loss
         """
         device = predictions.device
 
-        # 1. 位移预测损失 (MSE)
+        # 1. Displacement loss (MSE)
         loss_disp = F.mse_loss(predictions, targets)
 
-        # 2. 意图分类损失 (CrossEntropy)
+        # 2. Intent classification loss (CrossEntropy)
         loss_intent = F.cross_entropy(intent_logits, intent_labels)
 
-        # 3. 不确定性损失 (负对数似然)
-        # NLL = (pred - target)^2 / (2*var) + log(sqrt(2*pi*var))
-        # 其中 var = exp(logvar)
+        # 3. Uncertainty loss (negative log-likelihood)
+        # NLL = (pred - target)^2 / (2*var) + log(sqrt(2*pi*var)), where var = exp(logvar)
         logvar_clamped = uncertainty.clamp(-10, 10)
-        var = torch.exp(logvar_clamped)  # 防止数值爆炸
+        var = torch.exp(logvar_clamped)  # prevent numerical overflow
         nll = ((predictions - targets) ** 2 / (2 * var + 1e-8)
                + logvar_clamped * 0.5)
         loss_uncertainty = nll.mean()
 
-        # 4. 物理一致性损失（可选）
+        # 4. Physics consistency loss (optional)
         loss_physics = torch.tensor(0.0, device=device)
         if physics_trajectory is not None and gate_inertia is not None and self.ua_pgd is not None:
             loss_physics = self.ua_pgd.compute_physics_loss(
                 predictions, physics_trajectory, targets, gate_inertia
             )
 
-        # 5. 总损失
+        # 5. Total loss
         total_loss = (
             self.loss_weights['displacement'] * loss_disp +
             self.loss_weights['intent'] * loss_intent +
@@ -289,7 +288,7 @@ class TrajectoryPredictor(nn.Module):
         }
 
     def predict(self, history: torch.Tensor) -> torch.Tensor:
-        """推理接口: 直接返回预测位移"""
+        """Inference interface: returns predicted displacement."""
         with torch.no_grad():
             out = self.forward(history, force_predict=True)
             return out['predictions']
@@ -297,11 +296,8 @@ class TrajectoryPredictor(nn.Module):
     def predict_with_uncertainty(
         self, history: torch.Tensor, n_samples: int = 100
     ) -> Dict[str, torch.Tensor]:
-        """
-        不确定性感知推理 (Monte Carlo Dropout)
-        多次采样取均值和方差
-        """
-        self.train()  # 开启dropout
+        """Uncertainty-aware inference (Monte Carlo Dropout): sample multiple times, take mean and std."""
+        self.train()  # enable dropout
         all_preds = []
         for _ in range(n_samples):
             out = self.forward(history, force_predict=True)

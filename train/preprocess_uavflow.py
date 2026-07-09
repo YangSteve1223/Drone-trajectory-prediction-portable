@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""
-UAV-Flow 轨迹数据预处理: 生成滑动窗口 + 6类意图标注 (含 HOVER)。
+"""Preprocess UAV-Flow trajectories: sliding windows + 6-class intent labels (incl. HOVER).
 
-从 extract_uavflow.py 输出的轨迹 .npz 文件生成训练窗口。
+Reads .npz trajectories from extract_uavflow.py and generates training windows.
 
-意图类别 (6类):
-  0: STRAIGHT   — 直线飞行 (航向变化<15°, 垂直速率<2 m/s)
-  1: TURN_LEFT  — 左转 (航向变化<-30°)
-  2: TURN_RIGHT — 右转 (航向变化>30°)
-  3: ASCEND     — 上升 (垂直速率>2 m/s)
-  4: DESCEND    — 下降 (垂直速率<-2 m/s)
-  5: HOVER      — 悬停 (速度<0.3 m/s, 位移<0.5m)
+Intent classes (6):
+  0: STRAIGHT   — heading change <15deg, vertical rate <2 m/s
+  1: TURN_LEFT  — heading change <-30deg
+  2: TURN_RIGHT — heading change >30deg
+  3: ASCEND     — vertical rate >2 m/s
+  4: DESCEND    — vertical rate <-2 m/s
+  5: HOVER      — speed <0.3 m/s, displacement <0.5m
 
-输出: NPZ chunks (兼容 FastWindowDataset)
+Output: NPZ chunks (FastWindowDataset compatible)
   hist:     (N, 20, 6) float32  [x, y, z, vx, vy, vz]
-  pred:     (N, 20, 3) float32  [dx, dy, dz] 相对位移
-  intent:   (N,)      int32     意图标签 (0-5)
-  maneuver: (N,)      int32     机动等级 (0=平稳, 1=普通, 2=剧烈)
+  pred:     (N, 20, 3) float32  [dx, dy, dz] relative displacement
+  intent:   (N,)      int32     intent label (0-5)
+  maneuver: (N,)      int32     maneuver level (0=calm, 1=normal, 2=aggressive)
 
-用法:
+Usage:
   python preprocess_uavflow.py --traj_dir ./UAV-Flow-trajs --out_dir ./UAV-Flow-windows
   python preprocess_uavflow.py --traj_dir ./UAV-Flow-trajs --out_dir ./UAV-Flow-windows --val_ratio 0.1 --test_ratio 0.1
 """
@@ -30,36 +29,35 @@ import time
 import shutil
 from pathlib import Path
 
-# 窗口参数 (与 baseline 保持一致)
+# Window params (consistent with baseline)
 HIST_LEN = 20
 PRED_LEN = 20
 MIN_LEN = HIST_LEN + PRED_LEN  # 40
-DEFAULT_STRIDE = 3  # UAV-Flow 数据量较小, 使用更小的 stride 增加窗口数
-CHUNK_SIZE = 5000  # 每个 chunk 的窗口数 (较小以确保有足够 chunk 分配给 train/val/test)
+DEFAULT_STRIDE = 3  # small dataset, smaller stride for more windows
+CHUNK_SIZE = 5000  # windows per chunk (small to spread chunks across train/val/test)
 
 
 def classify_intent(hist_pos, hist_vel, pred_pos):
-    """
-    6类意图分类 (向量化版本用于单窗口)。
+    """6-class intent classification (single window).
 
     Args:
-        hist_pos: (20, 3) 历史位置 [x, y, z] (已中心化)
-        hist_vel: (20, 3) 历史速度 [vx, vy, vz]
-        pred_pos: (20, 3) 预测位置 [x, y, z] (相对 hist_pos[0])
+        hist_pos: (20, 3) history position [x, y, z] (centered)
+        hist_vel: (20, 3) history velocity [vx, vy, vz]
+        pred_pos: (20, 3) predicted position [x, y, z] (relative to hist_pos[0])
 
     Returns:
         intent: 0-5
     """
     dt = 0.2  # UAV-Flow is 5Hz
 
-    # 1. 检查 HOVER: 平均速度很低 且 总位移很小
+    # 1. HOVER: low average speed and small total displacement
     avg_speed = np.linalg.norm(hist_vel, axis=1).mean()
     total_displacement = np.linalg.norm(pred_pos[-1] - pred_pos[0])
 
     if avg_speed < 0.3 and total_displacement < 0.5:
         return 5  # HOVER
 
-    # 2. 计算航向角变化
+    # 2. Heading change
     hist_heading = np.arctan2(hist_vel[:, 1], hist_vel[:, 0])
 
     if len(pred_pos) > 1:
@@ -74,18 +72,18 @@ def classify_intent(hist_pos, hist_vel, pred_pos):
     heading_start = all_heading[:n_avg].mean()
     heading_end = all_heading[-n_avg:].mean()
     heading_change = heading_end - heading_start
-    # 归一化到 [-π, π]
+    # Normalize to [-pi, pi]
     heading_change = np.arctan2(np.sin(heading_change), np.cos(heading_change))
     heading_change_deg = np.degrees(heading_change)
 
-    # 3. 计算垂直速率
+    # 3. Vertical rate
     if len(pred_pos) > 1:
         vert_rate = np.diff(pred_pos[:, 2]) / dt
         avg_vert_rate = vert_rate.mean()
     else:
         avg_vert_rate = 0.0
 
-    # 4. 分类 (优先级: 垂直 > 转向 > 直线)
+    # 4. Classify (priority: vertical > turn > straight)
     if avg_vert_rate > 0.5:
         return 3  # ASCEND
     elif avg_vert_rate < -0.5:
@@ -99,8 +97,7 @@ def classify_intent(hist_pos, hist_vel, pred_pos):
 
 
 def classify_intent_batch(hist, pred):
-    """
-    批量向量化意图分类 (比逐窗口循环快 ~100x)。
+    """Vectorized batch intent classification (~100x faster than per-window loop).
 
     Args:
         hist: (N, 20, 6) [x, y, z, vx, vy, vz]
@@ -112,20 +109,20 @@ def classify_intent_batch(hist, pred):
     N = len(hist)
     dt = 0.2
 
-    # 历史速度
+    # History speed
     hv = hist[:, :, 3:6]  # (N, 20, 3)
     hist_speed = np.linalg.norm(hv, axis=2).mean(axis=1)  # (N,) avg speed
 
-    # 总位移
+    # Total displacement
     total_disp = np.linalg.norm(pred[:, -1, :] - pred[:, 0, :], axis=1)  # (N,)
 
     # HOVER mask
     hover_mask = (hist_speed < 0.3) & (total_disp < 0.5)
 
-    # 航向角
+    # Heading
     hist_heading = np.arctan2(hv[:, :, 1], hv[:, :, 0])  # (N, 20)
 
-    # 预测速度
+    # Predicted velocity
     pred_vel = np.diff(pred, axis=1) / dt  # (N, 19, 3)
     pred_heading = np.arctan2(pred_vel[:, :, 1], pred_vel[:, :, 0])  # (N, 19)
 
@@ -138,16 +135,16 @@ def classify_intent_batch(hist, pred):
     heading_change_deg = np.degrees(np.arctan2(np.sin(heading_change),
                                                 np.cos(heading_change)))
 
-    # 垂直速率
+    # Vertical rate
     avg_vert_rate = np.diff(pred[:, :, 2], axis=1).mean(axis=1) / dt  # (N,)
 
-    # 分类 (HOVER已预先标记, 其他按优先级)
-    intents = np.full(N, 0, dtype=np.int32)  # 默认 STRAIGHT
+    # Classify (HOVER pre-marked, rest by priority)
+    intents = np.full(N, 0, dtype=np.int32)  # default STRAIGHT
 
     # HOVER
     intents[hover_mask] = 5
 
-    # 非HOVER样本的其他分类
+    # Other classes for non-HOVER samples
     non_hover = ~hover_mask
 
     # ASCEND
@@ -166,18 +163,17 @@ def classify_intent_batch(hist, pred):
     right_mask = non_hover & ~ascend_mask & ~descend_mask & ~left_mask & (heading_change_deg > 45)
     intents[right_mask] = 2
 
-    # 其余保持 STRAIGHT (0)
+    # Rest stay STRAIGHT (0)
 
     return intents
 
 
 def generate_windows(traj, stride=DEFAULT_STRIDE):
-    """
-    从单条轨迹生成滑动窗口。
+    """Generate sliding windows from a single trajectory.
 
     Args:
         traj: (T, 6) float32  [x, y, z, vx, vy, vz]
-        stride: 窗口步长
+        stride: window stride
 
     Returns:
         hists:   (W, 20, 6)
@@ -201,42 +197,40 @@ def generate_windows(traj, stride=DEFAULT_STRIDE):
         end_hist = start + HIST_LEN
         end_pred = end_hist + PRED_LEN
 
-        # 历史窗口
+        # History window
         hist_seg = traj[start:end_hist].copy()  # (20, 6)
         hist_pos = hist_seg[:, :3]  # (20, 3)
         origin = hist_pos[0:1, :]
 
-        # 中心化位置
+        # Center position
         hist_pos_centered = hist_pos - origin
         hists[w, :, :3] = hist_pos_centered
         hists[w, :, 3:6] = hist_seg[:, 3:6]  # velocity unchanged
 
-        # 预测窗口
+        # Prediction window
         pred_seg = traj[end_hist:end_pred].copy()  # (20, 6)
         pred_pos = pred_seg[:, :3]
         pred_pos_centered = pred_pos - origin
         preds[w] = pred_pos_centered
 
-        # 意图标签
+        # Intent label
         hist_vel = hist_seg[:, 3:6]
         intents[w] = classify_intent(hist_pos_centered, hist_vel, pred_pos_centered)
 
-        # 机动等级
+        # Maneuver level
         avg_speed = np.linalg.norm(hist_vel, axis=1).mean()
         if avg_speed < 0.5:
-            maneuvers[w] = 0  # 平稳/悬停
+            maneuvers[w] = 0  # calm/hover
         elif avg_speed < 3:
-            maneuvers[w] = 1  # 普通
+            maneuvers[w] = 1  # normal
         else:
-            maneuvers[w] = 2  # 剧烈
+            maneuvers[w] = 2  # aggressive
 
     return hists, preds, intents, maneuvers
 
 
 def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stride: int = DEFAULT_STRIDE):
-    """
-    读取所有轨迹 NPZ, 生成窗口, 分配 train/val/test, 保存 chunks。
-    """
+    """Load all trajectory NPZ, generate windows, split train/val/test, save chunks."""
     traj_files = sorted(traj_dir.glob('*.npz'))
     if not traj_files:
         print(f'Error: No .npz files found in {traj_dir}')
@@ -245,13 +239,13 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
     print(f'Found {len(traj_files)} trajectory files')
     t0 = time.time()
 
-    # 临时目录
+    # Temp directory
     tmp_dir = out_dir / '.tmp_windows'
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True)
 
-    # 预分配缓冲区
+    # Preallocate buffers
     buf_hist = np.zeros((CHUNK_SIZE, HIST_LEN, 6), dtype=np.float32)
     buf_pred = np.zeros((CHUNK_SIZE, PRED_LEN, 3), dtype=np.float32)
     buf_intent = np.zeros(CHUNK_SIZE, dtype=np.int32)
@@ -260,7 +254,7 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
     chunk_idx = 0
     total_windows = 0
     skipped_traj = 0
-    all_window_intents = []  # 收集用于统计
+    all_window_intents = []  # collected for stats
 
     def save_chunk():
         nonlocal buf_fill, chunk_idx
@@ -279,7 +273,7 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
         chunk_idx += 1
         buf_fill = 0
 
-    # 处理每条轨迹
+    # Process each trajectory
     for i, tf in enumerate(traj_files):
         try:
             data = np.load(tf, allow_pickle=True)
@@ -299,7 +293,7 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
             skipped_traj += 1
             continue
 
-        # 写入缓冲区
+        # Write to buffer
         n = len(hists)
         if buf_fill + n > CHUNK_SIZE:
             save_chunk()
@@ -324,7 +318,7 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
     if skipped_traj:
         print(f'    Skipped {skipped_traj} trajectories (too short or errors)')
 
-    # 统计意图分布
+    # Intent distribution stats
     all_intents = np.concatenate(all_window_intents)
     intent_names = ['STRAIGHT', 'TURN_LEFT', 'TURN_RIGHT', 'ASCEND', 'DESCEND', 'HOVER']
     print(f'\n[2] Intent distribution:')
@@ -333,11 +327,11 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
         pct = count / len(all_intents) * 100
         print(f'    {k} {intent_names[k]:12s}: {count:>8,} ({pct:5.1f}%)')
 
-    # 分配 train/val/test
+    # Split into train/val/test
     print(f'\n[3] Splitting into train/val/test...')
     chunks = sorted(tmp_dir.glob('c*.npz'))
 
-    # 计算每个 chunk 的窗口数
+    # Window count per chunk
     chunk_sizes = []
     for cp in chunks:
         with np.load(cp, mmap_mode='r') as ch:
@@ -350,7 +344,7 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
     n_test = int(total * test_ratio)
     n_train = total - n_val - n_test
 
-    # 简单顺序分配 (已随机打乱的话, 也可以先 shuffle chunks)
+    # Simple sequential allocation (shuffle chunks first if needed)
     rng = np.random.RandomState(42)
     chunk_order = rng.permutation(len(chunks))
 
@@ -369,7 +363,7 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
             split_map['test'].append((ci, n))
             split_counts['test'] += n
 
-    # 重命名和移动到输出目录
+    # Rename and move to output directory
     out_dir.mkdir(parents=True, exist_ok=True)
     for split_name, chunk_list in split_map.items():
         for i, (ci, n) in enumerate(chunk_list):
@@ -384,7 +378,7 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
         print(f'  {split_name}: {len(chunk_list)} chunks, '
               f'{split_counts[split_name]:,} windows, {total_mb:.0f} MB')
 
-    # 元信息
+    # Metadata
     meta = {
         'hist_len': HIST_LEN,
         'pred_len': PRED_LEN,
@@ -405,7 +399,7 @@ def process_trajectories(traj_dir: Path, out_dir: Path, split_ratios: dict, stri
     with open(out_dir / 'windows_meta.json', 'w') as f:
         json.dump(meta, f, indent=2)
 
-    # 清理
+    # Cleanup
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
 

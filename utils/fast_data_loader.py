@@ -1,13 +1,5 @@
-﻿#!/usr/bin/env python3
-"""
-快速 DataLoader v2：预加载所有 chunk 到内存，消除磁盘 I/O 瓶颈。
-
-npz 文件结构：
-    hist    : (N, hist_len, 6)  float32  [pos+vel]
-    pred    : (N, pred_len, 3)  float32  [pos delta]
-    intent  : (N,)             int32    意图标签
-    maneuver: (N,)             int32    机动等级
-"""
+#!/usr/bin/env python3
+"""Fast DataLoader v2: preloads all chunks into memory to remove disk I/O bottleneck."""
 
 import numpy as np
 import torch
@@ -17,10 +9,7 @@ from typing import Literal
 
 
 class FastWindowDataset(Dataset):
-    """
-    预加载型数据集：初始化时将所有 chunk 加载到内存（约 1.2 GB），
-    __getitem__ 直接从内存索引，不再触碰磁盘。
-    """
+    """Preloaded dataset: loads all chunks into RAM at init, __getitem__ indexes memory only."""
 
     def __init__(
         self,
@@ -30,21 +19,21 @@ class FastWindowDataset(Dataset):
     ):
         """
         Args:
-            data_root: SimCruise 目录路径
+            data_root: SimCruise directory path
             split: train/val/test
-            label_remap: 标签重映射 dict, 如 {4:3} 将 DESCEND→3 (ASCEND空缺)
+            label_remap: label remap dict, e.g. {4:3} maps DESCEND->3 (ASCEND absent)
         """
         self.data_root = Path(data_root)
         self.split = split
 
-        # 收集 chunk 文件
+        # Collect chunk files
         chunk_files = sorted(self.data_root.rglob(f"windows_{split}_chunk*.npz"))
         if not chunk_files:
             raise FileNotFoundError(
                 f"No windows_{split}_chunk*.npz found in {self.data_root}"
             )
 
-        # 第一遍：统计样本数，建立索引范围
+        # First pass: count samples, build index ranges
         chunk_offsets = [0]
         n_per_chunk = []
         valid_files = []
@@ -69,7 +58,7 @@ class FastWindowDataset(Dataset):
         self.n_samples = chunk_offsets[-1]
         self.label_remap = label_remap or {}
 
-        # 第二遍：预加载所有 chunk 到内存
+        # Second pass: preload all chunks into RAM
         print(
             f"[FastWindowDataset] Loading {len(valid_files)} chunks "
             f"({self.n_samples:,} {split} samples) into RAM..."
@@ -89,7 +78,7 @@ class FastWindowDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
-        """从预加载内存数组直接索引，零 I/O"""
+        """Index directly from preloaded memory arrays, zero I/O."""
         for ci, (start, n) in enumerate(
             zip(self.chunk_offsets[:-1], self.n_per_chunk)
         ):
@@ -115,13 +104,12 @@ def get_dataloader(
     shuffle: bool = None,
     label_remap: dict = None,
 ):
-    """工厂函数。Windows 下需要 if __name__ == '__main__' 保护。"""
+    """Factory function. Needs if __name__ == '__main__' guard on Windows."""
     import platform
     if shuffle is None:
         shuffle = split == "train"
 
-    # Windows 下 multiprocessing spawn 需要主模块保护
-    # 如果调用方未正确保护, 自动降级为单进程
+    # Windows spawn multiprocessing needs main-module guard; fall back to single process if unprotected
     effective_workers = num_workers
     if platform.system() == 'Windows' and num_workers > 0:
         try:
@@ -156,14 +144,14 @@ if __name__ == "__main__":
         t0 = time.time()
         ds = FastWindowDataset(data_root, split=split)
         print(f"  init={time.time() - t0:.1f}s")
-        # 测试读取速度
+        # Test read speed
         t0 = time.perf_counter()
         for i in range(1000):
             _ = ds[i % len(ds)]
         elapsed = time.perf_counter() - t0
         print(f"  1000 reads: {elapsed:.3f}s  ({elapsed/1000*1000:.1f}ms/sample)")
 
-    # 测试 DataLoader
+    # Test DataLoader
     ds = FastWindowDataset(data_root, split="train")
     loader = get_dataloader(data_root, split="train", batch_size=32)
     t0 = time.perf_counter()

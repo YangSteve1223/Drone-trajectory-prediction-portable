@@ -1,32 +1,5 @@
-"""
-Intent-Aware Dynamic Temporal Pyramid (IA-DTP) — Enhanced Version.
-
-PPT Slide 7: "在统一框架下实现多尺度残差特征提取与隐式飞行意图感知的协同建模。
-通过自适应地捕获高频机动下的微观状态残差，IA-DTP 能够生成融合了多尺度状态变化
-与宏观意图先验的全局上下文向量。"
-
-Architecture (Enhanced):
-  Encoded Features (B, T, d_model)
-      │
-      ├─ MultiScaleTemporalPyramid ──────────────────────┐
-      │   ├─ Scale 0: origin (T)                          │
-      │   ├─ Scale 1: stride-2 down (T/2)                 │
-      │   └─ Scale 2: stride-4 down (T/4)                 │
-      │       ↓                                            │
-      │   Per-Scale Residual Conv1D + HF Extraction        │
-      │       ↓                                            │
-      ├─ CrossScaleAttention ─────────────────────────────┤
-      │   ├─ Coarse→Fine: coarse features guide fine       │
-      │   └─ Fine→Coarse: fine features enrich coarse      │
-      │       ↓                                            │
-      ├─ AdaptiveFusion (learned per-scale weights) ──────┤
-      │       ↓                                            │
-      ├─ IntentHead ─→ intent_logits (B, 5)              │
-      │       ↓                                            │
-      ├─ AnchorGenerator ─→ global_anchor (B, 1, d_model) │
-      │       ↓                                            │
-      └─ FeatureEnhancement ─→ enhanced_features (B,T,d_model)
-"""
+"""Intent-Aware Dynamic Temporal Pyramid: multi-scale residual features + cross-scale attention
+for implicit flight intent perception and anchor generation."""
 
 import torch
 import torch.nn as nn
@@ -52,31 +25,31 @@ NUM_INTENT_CLASSES = 5
 
 class MultiScaleTemporalPyramid(nn.Module):
     """
-    多尺度时序金字塔: 在不同时间分辨率下提取特征.
+    Multi-scale temporal pyramid: extract features at multiple time resolutions.
 
     Scales:
-      - Scale 0: 原始分辨率 T → 捕捉微观机动细节
-      - Scale 1: stride-2 降采样 T/2 → 捕捉中观机动模式
-      - Scale 2: stride-4 降采样 T/4 → 捕捉宏观意图趋势
+      - Scale 0: full resolution T (micro maneuver detail)
+      - Scale 1: stride-2 downsample T/2 (meso maneuver pattern)
+      - Scale 2: stride-4 downsample T/4 (macro intent trend)
 
     Args:
-        d_model: 特征维度
-        num_scales: 金字塔层数 (default: 3)
-        kernel_size: 每层卷积核大小
+        d_model: feature dim
+        num_scales: pyramid levels (default: 3)
+        kernel_size: conv kernel size per level
     """
     def __init__(self, d_model: int = 256, num_scales: int = 3, kernel_size: int = 3):
         super().__init__()
         self.d_model = d_model
         self.num_scales = num_scales
 
-        # 每个尺度的降采样卷积 (stride=2)
+        # Downsampling conv per scale (stride=2)
         self.down_convs = nn.ModuleList()
         for s in range(num_scales - 1):
             self.down_convs.append(
                 nn.Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1, groups=1)
             )
 
-        # 每个尺度的处理卷积 + 残差块
+        # Per-scale processing conv + residual block
         self.scale_convs = nn.ModuleList()
         self.scale_residuals = nn.ModuleList()
         for s in range(num_scales):
@@ -88,7 +61,7 @@ class MultiScaleTemporalPyramid(nn.Module):
                     nn.Conv1d(d_model, d_model, kernel_size, padding=kernel_size // 2),
                 )
             )
-            # 高频残差提取 (对原始特征做差分, 捕获机动突变)
+            # High-frequency residual (diff of raw features to catch maneuver bursts)
             self.scale_residuals.append(
                 nn.Sequential(
                     nn.Conv1d(d_model, d_model // 2, kernel_size=5, padding=2),
@@ -97,7 +70,7 @@ class MultiScaleTemporalPyramid(nn.Module):
                 )
             )
 
-        # 上采样投影 (恢复原始分辨率)
+        # Upsampling projection (restore original resolution)
         self.up_projs = nn.ModuleList()
         for s in range(1, num_scales):
             self.up_projs.append(
@@ -112,43 +85,43 @@ class MultiScaleTemporalPyramid(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, list]:
         """
         Args:
-            x: (B, T, d_model) 编码特征
+            x: (B, T, d_model) encoded features
         Returns:
-            fused: (B, T, d_model) 多尺度融合特征
+            fused: (B, T, d_model) multi-scale fused features
             scale_features: list of (B, d_model) per-scale pooled features
         """
         B, T, D = x.shape
         x_t = x.transpose(1, 2)  # (B, d_model, T)
 
-        # 构建金字塔
-        pyramid = [x_t]  # Scale 0: 原始分辨率
+        # Build pyramid
+        pyramid = [x_t]  # Scale 0: full resolution
         for down_conv in self.down_convs:
             pyramid.append(down_conv(pyramid[-1]))
 
-        # 每层处理 + 高频残差提取
+        # Per-level processing + high-frequency residual
         processed = []
         scale_pooled = []
         for s, (conv, res_block) in enumerate(zip(self.scale_convs, self.scale_residuals)):
             feat = pyramid[s]  # (B, d_model, T_s)
-            # 主通路
+            # Main path
             main = conv(feat)
-            # 高频残差: 对相邻帧差分, 放大机动突变信号
+            # High-frequency residual: adjacent-frame diff amplifies maneuver bursts
             feat_diff = feat[:, :, 1:] - feat[:, :, :-1]  # (B, d_model, T_s-1)
             feat_diff_padded = F.pad(feat_diff, (1, 0), mode='replicate')
             hf_residual = res_block(feat_diff_padded)
-            # 残差融合
+            # Residual fusion
             out = main + hf_residual
             out = out + feat  # skip connection
             processed.append(out)
-            # 池化到固定维度
+            # Pool to fixed dim
             scale_pooled.append(out.mean(dim=-1))  # (B, d_model)
 
-        # 上采样恢复到原始 T
+        # Upsample back to original T
         upsampled = [processed[0].transpose(1, 2)]  # Scale 0: (B, T, d_model)
         for s in range(1, self.num_scales):
             up_proj = self.up_projs[s - 1]
             feat_up = up_proj(processed[s])  # (B, d_model, T)
-            # 截断或填充以匹配原始 T
+            # Truncate or pad to match original T
             if feat_up.shape[-1] > T:
                 feat_up = feat_up[:, :, :T]
             elif feat_up.shape[-1] < T:
@@ -164,9 +137,9 @@ class MultiScaleTemporalPyramid(nn.Module):
 
 class CrossScaleAttention(nn.Module):
     """
-    跨尺度注意力: 粗尺度引导细尺度, 细尺度丰富粗尺度.
+    Cross-scale attention: coarse guides fine, fine enriches coarse.
 
-    双向交互:
+    Bidirectional:
       - Coarse→Fine: queries from fine, keys/values from coarse
       - Fine→Coarse: queries from coarse, keys/values from fine
     """
@@ -197,14 +170,14 @@ class CrossScaleAttention(nn.Module):
         Returns:
             fused: (B, T, d_model) cross-scale attended features
         """
-        # 取最细和最粗尺度做交叉注意力
+        # Use finest and coarsest scales for cross attention
         fine = multi_scale_features[0]   # (B, T, d_model)
         coarse = multi_scale_features[-1]  # (B, T, d_model)
 
         B, T_f, D = fine.shape
         _, T_c, _ = coarse.shape
 
-        # 如果时序长度不同 (因上采样截断), 对齐
+        # Align time length if different (from upsample truncation)
         if T_f != T_c:
             if T_c > T_f:
                 coarse = coarse[:, :T_f, :]
@@ -227,7 +200,7 @@ class CrossScaleAttention(nn.Module):
         # Fine→Coarse: coarse queries fine (fine details enrich coarse)
         fc_attn = self._attention(q_coarse, k_fine, v_fine)
 
-        # 融合
+        # Fuse
         cf_out = cf_attn.transpose(1, 2).reshape(B, T_f, D)
         fc_out = fc_attn.transpose(1, 2).reshape(B, T_c, D)
 
@@ -249,15 +222,16 @@ class CrossScaleAttention(nn.Module):
 
 class AdaptiveFusion(nn.Module):
     """
-    自适应多尺度融合: 根据轨迹动态特性学习每层权重.
+    Adaptive multi-scale fusion: learn per-scale weights from trajectory dynamics.
 
-    直觉: 平稳飞行时细尺度更重要, 急剧机动时粗尺度 (宏观趋势) 更重要.
+    Intuition: fine scale matters more in stable flight, coarse scale (macro trend)
+    matters more in sharp maneuvers.
     """
     def __init__(self, d_model: int = 256, num_scales: int = 3):
         super().__init__()
         self.num_scales = num_scales
 
-        # 动态权重预测器
+        # Dynamic weight predictor
         self.weight_predictor = nn.Sequential(
             nn.Linear(d_model * num_scales, d_model // 2),
             nn.SiLU(),
@@ -273,13 +247,13 @@ class AdaptiveFusion(nn.Module):
             scale_features: list of (B, T, d_model)
             scale_pooled: list of (B, d_model)
         Returns:
-            fused: (B, T, d_model) 自适应加权融合特征
+            fused: (B, T, d_model) adaptively weighted fused features
         """
-        # 拼接所有尺度的池化特征来预测权重
+        # Concat all scale pooled features to predict weights
         pooled_cat = torch.cat(scale_pooled, dim=-1)  # (B, d_model * num_scales)
         weights = self.weight_predictor(pooled_cat)    # (B, num_scales)
 
-        # 加权融合
+        # Weighted fusion
         fused = torch.zeros_like(scale_features[0])
         for s in range(self.num_scales):
             w = weights[:, s:s+1].unsqueeze(-1)  # (B, 1, 1)
@@ -296,17 +270,17 @@ class IntentAwareDTP(nn.Module):
     """
     Intent-Aware Dynamic Temporal Pyramid (Enhanced).
 
-    三阶段流程:
+    Three stages:
       1. Multi-scale temporal pyramid → multi-scale features
       2. Cross-scale attention → coarse↔fine bidirectional interaction
       3. Adaptive fusion + intent classification + anchor generation
 
     Args:
-        d_model: 特征维度 (from EMam-SE)
-        num_classes: 意图类别数
-        hidden_dim: 意图分类头隐层维度
-        num_scales: 时序金字塔层数
-        num_heads: 跨尺度注意力头数
+        d_model: feature dim (from EMam-SE)
+        num_classes: number of intent classes
+        hidden_dim: intent head hidden dim
+        num_scales: pyramid levels
+        num_heads: cross-scale attention heads
     """
     def __init__(
         self,
@@ -320,22 +294,22 @@ class IntentAwareDTP(nn.Module):
         self.num_classes = num_classes
         self.d_model = d_model
 
-        # 多尺度时序金字塔
+        # Multi-scale temporal pyramid
         self.pyramid = MultiScaleTemporalPyramid(
             d_model=d_model, num_scales=num_scales
         )
 
-        # 跨尺度注意力
+        # Cross-scale attention
         self.cross_attn = CrossScaleAttention(
             d_model=d_model, num_heads=num_heads
         )
 
-        # 自适应融合
+        # Adaptive fusion
         self.fusion = AdaptiveFusion(
             d_model=d_model, num_scales=num_scales
         )
 
-        # 意图分类头
+        # Intent classification head
         self.intent_head = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -346,7 +320,7 @@ class IntentAwareDTP(nn.Module):
             nn.Linear(hidden_dim // 2, num_classes),
         )
 
-        # 全局锚点生成器 (融合多尺度上下文 + 意图信息)
+        # Global anchor generator (fuses multi-scale context + intent info)
         self.anchor_proj = nn.Sequential(
             nn.Linear(d_model * 2 + num_classes, d_model),
             nn.LayerNorm(d_model),
@@ -354,7 +328,7 @@ class IntentAwareDTP(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # 特征增强: 将意图 + 锚点信息注入回时序特征
+        # Feature enhancement: inject intent + anchor back into temporal features
         self.enhance = nn.Sequential(
             nn.Linear(d_model + num_classes + d_model, d_model),
             nn.LayerNorm(d_model),
@@ -370,8 +344,8 @@ class IntentAwareDTP(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
-            encoded_features: (B, T, d_model) EMam-SE 编码特征
-            historical_trajectory: (B, T, 6) 原始轨迹 (可选, 用于运动学分析)
+            encoded_features: (B, T, d_model) EMam-SE encoded features
+            historical_trajectory: (B, T, 6) raw trajectory (optional, for kinematics)
         Returns:
             global_anchor: (B, 1, d_model)
             intent_logits: (B, num_classes)
@@ -381,40 +355,40 @@ class IntentAwareDTP(nn.Module):
         B, T, D = encoded_features.shape
 
         # ================================================================
-        # Stage 1: 多尺度时序金字塔
+        # Stage 1: multi-scale temporal pyramid
         # ================================================================
         scale_features, scale_pooled = self.pyramid(encoded_features)
         # scale_features: list of (B, T, d_model), [fine, mid, coarse]
         # scale_pooled:  list of (B, d_model)
 
         # ================================================================
-        # Stage 2: 跨尺度注意力 (双向交互)
+        # Stage 2: cross-scale attention (bidirectional)
         # ================================================================
         cross_attended = self.cross_attn(scale_features)  # (B, T, d_model)
 
         # ================================================================
-        # Stage 3: 自适应融合
+        # Stage 3: adaptive fusion
         # ================================================================
         fused_features = self.fusion(scale_features, scale_pooled)  # (B, T, d_model)
 
-        # 将跨尺度注意力结果与自适应融合结果结合
+        # Combine cross-scale attention with adaptive fusion
         combined = cross_attended + fused_features  # (B, T, d_model)
 
         # ================================================================
-        # Stage 4: 意图分类
+        # Stage 4: intent classification
         # ================================================================
-        # 全局池化 + 分类
+        # Global pooling + classify
         global_feat = combined.mean(dim=1)  # (B, d_model)
         intent_logits = self.intent_head(global_feat)  # (B, num_classes)
         intent_probs = F.softmax(intent_logits, dim=-1)
 
         # ================================================================
-        # Stage 5: 全局锚点生成 (多尺度上下文 + 意图先验)
+        # Stage 5: global anchor generation (multi-scale context + intent prior)
         # ================================================================
-        # 粗尺度全局信息 (宏观趋势)
+        # Coarse-scale global info (macro trend)
         coarse_global = scale_pooled[-1]  # (B, d_model)
 
-        # 拼接: 精细全局 + 粗糙全局 + 意图分布
+        # Concat: fine global + coarse global + intent distribution
         anchor_input = torch.cat([
             global_feat,          # (B, d_model) — fine-grained
             coarse_global,        # (B, d_model) — coarse trend
@@ -424,7 +398,7 @@ class IntentAwareDTP(nn.Module):
         global_anchor = self.anchor_proj(anchor_input).unsqueeze(1)  # (B, 1, d_model)
 
         # ================================================================
-        # Stage 6: 时序特征增强 (注入意图 + 锚点)
+        # Stage 6: temporal feature enhancement (inject intent + anchor)
         # ================================================================
         intent_tiled = intent_probs.unsqueeze(1).expand(-1, T, -1)    # (B, T, num_classes)
         anchor_tiled = global_anchor.expand(-1, T, -1)                # (B, T, d_model)
