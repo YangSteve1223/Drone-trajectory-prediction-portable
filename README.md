@@ -142,11 +142,11 @@ python train_multi_head.py --model high --K 5 --epochs 10 --batch_size 64
 | `train_multi_head.py` | 多假设 WTA 训练 (支持 LOW+HIGH) | `python train_multi_head.py --model low --K 5 --resume` |
 | `evaluate.py` | ADE/FDE/意图/不确定性评估 | `python evaluate.py` |
 | `eval_multi_head.py` | 多假设完整测试集评估 | `python eval_multi_head.py` |
-| `visualize_low_multihyp.py` | **LOW 多假设轨迹图表 (5张)** ★ | `python visualize_low_multihyp.py` |
-| `visualize_trajectories.py` | HIGH 多假设轨迹图表 | `python visualize_trajectories.py` |
+| `visualize_low_multihyp.py` | **LOW 多假设 24 样本轨迹 (10张)** ★ | `python visualize_low_multihyp.py` |
+| `visualize_trajectories.py` | HIGH 多假设 12 样本轨迹图表 | `python visualize_trajectories.py` |
 | `visualize_multihyp.py` | 多假设对比图表 | `python visualize_multihyp.py` |
-| `visualize_final.py` | 8 张科研图表 (已清理，仅保留热力图) | `python visualize_final.py` |
 | `compare_low_models.py` | LOW 单模型 vs 多假设对比 | `python compare_low_models.py` |
+| `eval_bidirectional.py` | 双向 Mamba 评估 (已否决) | `python eval_bidirectional.py` |
 | `diagnose_failures.py` | 最差样本深度诊断 | `python diagnose_failures.py` |
 | `rollout.py` | 自回归预测外推 | `python rollout.py` |
 | `fix_labels.py` | UAV-Flow 标签修正 | `python fix_labels.py` |
