@@ -93,21 +93,34 @@ python train_multi_head.py --model high --K 5 --epochs 10 --batch_size 64
 └── README.md
 ```
 
-## 性能指标 (2026-07-07)
+## 性能指标 (2026-07-09)
 
 ### 单模型 (确定性预测)
 
 | 指标 | LOW (UAV-Flow) | HIGH (SimCruise) |
 |:--|:--:|:--:|
 | ADE mean / median | 0.61m / 0.50m | 1.71m / 0.75m |
-| FDE mean / median | 1.38m / 1.15m | 5.46m / 1.42m |
+| FDE mean / median | 1.39m / 1.15m | 5.46m / 1.42m |
 | FDE P95 | 3.45m | 36.97m |
-| 方向误差 | 23° | 0.1° |
-| 灾难性失败 (>90°) | 0.52% | 0% |
+| 方向误差 | 24.5° | 0.1° |
+| 灾难性失败 (>90°) | 3.35% | 0% |
 | 最佳意图 | HOVER 0.19m | STRAIGHT 1.42m |
-| 最差意图 | TURN_R 1.55m | **DESCEND 27.26m** |
+| 最差意图 | DESCEND 4.08m | **DESCEND 27.26m** |
 
-### 多假设预测 (K=5, 5轮 WTA 训练, 150K 测试集全量评估)
+### 多假设预测 — LOW (K=5, 5轮 WTA, 24.9K 测试集全量)
+
+| 指标 | 单模型 | minFDE_5 | 改善 |
+|:--|:--:|:--:|:--:|
+| 整体 minADE_5 | 0.61m | **0.48m** | **+21.6%** |
+| 整体 minFDE_5 | 1.39m | **0.94m** | **+32.3%** |
+| FDE P95 | 3.45m | **2.31m** | **+33.2%** |
+| 方向误差 mean | 24.5° | **17.5°** | **+28.5%** |
+| 灾难性失败 | 3.35% | **2.94%** | **+12.5%** |
+| STRAIGHT | 1.21m | 0.83m | +31.1% |
+| TURN_L | 1.38m | 0.94m | +32.5% |
+| TURN_R | 1.55m | 1.01m | +34.5% |
+
+### 多假设预测 — HIGH (K=5, 5轮 WTA, 150K 测试集全量)
 
 | 指标 | 单模型 | minFDE_5 | 改善 |
 |:--|:--:|:--:|:--:|
@@ -119,21 +132,22 @@ python train_multi_head.py --model high --K 5 --epochs 10 --batch_size 64
 | TURN_R | 3.65m | 3.26m | +11% |
 | **DESCEND** | **27.26m** | **6.13m** | **+78%** |
 
-> 仅训练 48K 参数（总参数 3.5%），5 轮约 50 分钟。多假设让模型不需要"猜对"唯一轨迹，只需要覆盖可能性。
+> 多假设仅训练 48K 参数（总参数 3.5%），LOW 5 轮约 14 分钟，HIGH 5 轮约 50 分钟。
 
 ## 脚本速查
 
 | 脚本 | 用途 | 命令示例 |
 |:--|:--|:--|
 | `predictor.py` | 推理入口 (软融合+Z纠正) | `from predictor import DronePredictor` |
-| `train_multi_head.py` | 多假设 WTA 训练 (含断点续训) | `python train_multi_head.py --model high --K 5 --resume` |
+| `train_multi_head.py` | 多假设 WTA 训练 (支持 LOW+HIGH) | `python train_multi_head.py --model low --K 5 --resume` |
 | `evaluate.py` | ADE/FDE/意图/不确定性评估 | `python evaluate.py` |
 | `eval_multi_head.py` | 多假设完整测试集评估 | `python eval_multi_head.py` |
-| `visualize_trajectories.py` | LOW+HIGH 精选轨迹图表 | `python visualize_trajectories.py` |
-| `visualize_final.py` | 8 张科研图表 | `python visualize_final.py` |
-| `visualize_multihyp.py` | 多假设专属图表 | `python visualize_multihyp.py` |
+| `visualize_low_multihyp.py` | **LOW 多假设轨迹图表 (5张)** ★ | `python visualize_low_multihyp.py` |
+| `visualize_trajectories.py` | HIGH 多假设轨迹图表 | `python visualize_trajectories.py` |
+| `visualize_multihyp.py` | 多假设对比图表 | `python visualize_multihyp.py` |
+| `visualize_final.py` | 8 张科研图表 (已清理，仅保留热力图) | `python visualize_final.py` |
+| `compare_low_models.py` | LOW 单模型 vs 多假设对比 | `python compare_low_models.py` |
 | `diagnose_failures.py` | 最差样本深度诊断 | `python diagnose_failures.py` |
-| `run_all.py` | 基础轨迹可视化 | `python run_all.py` |
 | `rollout.py` | 自回归预测外推 | `python rollout.py` |
 | `fix_labels.py` | UAV-Flow 标签修正 | `python fix_labels.py` |
 
@@ -147,16 +161,15 @@ python train_multi_head.py --model high --K 5 --epochs 10 --batch_size 64
 
 ## 后续方向
 
-HIGH 模型已较好解决（minFDE_5=1.84m，DESCEND -78%）。**后续重点优化 LOW 模型**：
-- LOW 多假设训练（目前仅 HIGH 有多假设）
-- 方向误差降低（当前 23°，远差于 HIGH 的 0.1°）
+- **LOW 方向误差**仍偏高（17.5° vs HIGH 0.1°），多假设已改善 28.5%，仍有优化空间
 - 极端转弯 (>150°) 处理
-- LOW Z 轴纠正
+- 实时在线学习 (LoRA) 验证
+- HOVER 类别在多假设下略有退化（0.19m → 0.40m），可考虑意图感知的 K 值调整
 
 ## 已知问题
 
-- **LOW 方向误差 23°** vs HIGH 0.1° — 最大差距
-- **LOW 极端转弯** (>150°): 模型可能预测 STRAIGHT（73% mismatch）
+- **LOW 方向误差 17.5°** vs HIGH 0.1° — 虽已改善但仍是最主要差距
+- **LOW 极端转弯** (>150°): 模型可能预测 STRAIGHT
 - 物理模型（2 帧速度）过于简单
 - Context Adapter 仅验证于仿真数据
 

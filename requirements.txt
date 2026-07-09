@@ -1,0 +1,21 @@
+# EMAM Drone Trajectory Prediction - Dependencies
+# Tested on: Windows 11, Python 3.10.10, CUDA 11.8, RTX 3060 Laptop (6GB)
+# Install: pip install -r requirements.txt
+
+# Core (required)
+torch>=2.0.0,<3.0.0          # PyTorch 2.7.1 tested
+numpy>=1.24.0,<3.0.0         # 2.1.2 tested
+tqdm>=4.60.0                  # progress bars (4.67.3 tested)
+
+# Visualization (required for chart scripts)
+matplotlib>=3.7.0,<4.0.0     # 3.9.2 tested
+scipy>=1.10.0                 # 1.15.1 tested (interpolation in some scripts)
+
+# Training (optional - only needed for train/train.py)
+pyyaml>=6.0                   # 6.0.2 tested (training config YAML)
+
+# Data extraction (optional - only needed for train/extract_uavflow.py)
+pyarrow>=12.0.0               # 24.0.0 tested (parquet reading)
+
+# For weighted AdamW (optional, improves multi-hypothesis training)
+# torch-optimizer>=0.3.0      # uncomment if using AdaBelief/other optimizers

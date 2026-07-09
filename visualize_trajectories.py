@@ -260,6 +260,10 @@ def chart_high_multihyp_3d(samples):
             ax.scatter(*ba[e-1],c='#00E676',s=12,marker='s',alpha=0.8)
         se = seg_errs(ba,ga,HSEG); es = ' | '.join([f'{l}:{np.mean(e):.1f}m' for l,e in se])
         ax.set_title(f'#{idx+1} {INTENT_4[intent]} minFDE={min_fde:.1f}m\n{es}',fontsize=6.5,family='monospace')
+        z_all = np.concatenate([hp[:,2], ga[:,2], ba[:,2]])
+        xy_range = max(ga[:,0].max()-ga[:,0].min(), ga[:,1].max()-ga[:,1].min(), 0.5)
+        z_mid = (z_all.max()+z_all.min())/2
+        ax.set_zlim(z_mid - xy_range*0.5, z_mid + xy_range*0.5)
         ax.xaxis.pane.fill=False; ax.yaxis.pane.fill=False; ax.zaxis.pane.fill=False
         ax.xaxis.pane.set_edgecolor('w'); ax.yaxis.pane.set_edgecolor('w'); ax.zaxis.pane.set_edgecolor('w')
         ax.tick_params(labelsize=5)
@@ -284,6 +288,10 @@ def chart_high_best_3d(samples):
             ax.scatter(*ba[e-1],c='#00E676',s=18,marker='s',alpha=0.8)
         se = seg_errs(ba,ga,HSEG); es = ' | '.join([f'{l}:{np.mean(e):.1f}m' for l,e in se])
         ax.set_title(f'#{idx+1} {INTENT_4[intent]} minFDE={min_fde:.1f}m\n{es}',fontsize=6.5,family='monospace')
+        z_all = np.concatenate([hp[:,2], ga[:,2], ba[:,2]])
+        xy_range = max(ga[:,0].max()-ga[:,0].min(), ga[:,1].max()-ga[:,1].min(), 0.5)
+        z_mid = (z_all.max()+z_all.min())/2
+        ax.set_zlim(z_mid - xy_range*0.5, z_mid + xy_range*0.5)
         ax.xaxis.pane.fill=False; ax.yaxis.pane.fill=False; ax.zaxis.pane.fill=False
         ax.xaxis.pane.set_edgecolor('w'); ax.yaxis.pane.set_edgecolor('w'); ax.zaxis.pane.set_edgecolor('w')
         ax.tick_params(labelsize=5)

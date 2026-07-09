@@ -267,6 +267,60 @@ class DronePredictor:
             if apply_mask.any():
                 out_high['predictions'][apply_mask, :, 2] *= dampen[apply_mask].view(-1, 1)
 
+            # ── LOW Z轴纠正 (DESCEND=class 4, 6-class) ──
+            # LOW 模型同样受益于Z纠正: 低速无人机在DESCEND时也有Z漂移问题
+            low_intent_prob = torch.softmax(out_low['intent_logits'], dim=-1)
+            low_descend_prob = low_intent_prob[:, 4]            # class 4 = DESCEND
+
+            low_dampen = torch.full_like(low_descend_prob, 1.0)
+            low_strong = low_descend_prob < Z_DESCEND_THRESHOLD_LOW
+            low_weak = (low_descend_prob >= Z_DESCEND_THRESHOLD_LOW) & (low_descend_prob < Z_DESCEND_THRESHOLD_HIGH)
+
+            if low_strong.any():
+                low_dampen[low_strong] = Z_DAMPEN_STRONG
+            if low_weak.any():
+                t_low = (low_descend_prob[low_weak] - Z_DESCEND_THRESHOLD_LOW) / (Z_DESCEND_THRESHOLD_HIGH - Z_DESCEND_THRESHOLD_LOW)
+                low_dampen[low_weak] = Z_DAMPEN_WEAK + (1.0 - Z_DAMPEN_WEAK) * t_low
+
+            # 多信号融合 for LOW (reuse same thresholds, LOW drones are slower so signals are more conservative)
+            if Z_TREND_ENABLED or Z_UNCERTAINTY_ENABLED or Z_MAGNITUDE_ENABLED:
+                low_boost = torch.zeros_like(low_dampen)
+
+                if Z_TREND_ENABLED:
+                    z_info = self.compute_z_trend(hist, window=Z_TREND_WINDOW)
+                    low_boost = low_boost + torch.where(
+                        z_info['is_descending'],
+                        torch.full_like(low_dampen, Z_TREND_DAMPEN_BOOST),
+                        torch.zeros_like(low_dampen)
+                    )
+
+                if Z_UNCERTAINTY_ENABLED:
+                    z_logvar_low = out_low['uncertainty'][:, :, 2]
+                    z_mean_logvar_low = z_logvar_low.mean(dim=1)
+                    low_uncertainty_low = z_mean_logvar_low < Z_UNCERTAINTY_THRESH
+                    low_boost = low_boost + torch.where(
+                        low_uncertainty_low,
+                        torch.full_like(low_dampen, Z_UNCERTAINTY_BOOST),
+                        torch.zeros_like(low_dampen)
+                    )
+
+                if Z_MAGNITUDE_ENABLED:
+                    # LOW drones move slower, use lower magnitude threshold (2.5m vs 5.0m)
+                    low_mag_thresh = Z_MAGNITUDE_THRESH * 0.5
+                    pred_z_final_low = out_low['predictions'][:, -1, 2]
+                    large_descent_low = pred_z_final_low < -low_mag_thresh
+                    low_boost = low_boost + torch.where(
+                        large_descent_low,
+                        torch.full_like(low_dampen, Z_MAGNITUDE_BOOST),
+                        torch.zeros_like(low_dampen)
+                    )
+
+                low_dampen = torch.clamp(low_dampen + low_boost, 0.0, 1.0)
+
+            low_apply = low_dampen < 1.0
+            if low_apply.any():
+                out_low['predictions'][low_apply, :, 2] *= low_dampen[low_apply].view(-1, 1)
+
         # 熵引导物理融合: LOW模型意图不确定时偏向物理外推
         # 高熵(=模型在STRAIGHT/TURN之间纠结)时, 物理外推保留转弯动量, 比混乱的anchor更可靠
         if ENTROPY_PHYSICS_ENABLED:
@@ -494,6 +548,57 @@ class DronePredictor:
                 apply_mask = dampen < 1.0
                 if apply_mask.any():
                     out_high['predictions'][apply_mask, :, 2] *= dampen[apply_mask].view(-1, 1)
+
+                # ── LOW Z轴纠正 (DESCEND=class 4 in 6-class) ──
+                low_intent_prob = torch.softmax(out_low['intent_logits'], dim=-1)
+                low_descend_prob = low_intent_prob[:, 4]
+
+                low_dampen = torch.full_like(low_descend_prob, 1.0)
+                low_strong = low_descend_prob < Z_DESCEND_THRESHOLD_LOW
+                low_weak = (low_descend_prob >= Z_DESCEND_THRESHOLD_LOW) & (low_descend_prob < Z_DESCEND_THRESHOLD_HIGH)
+
+                if low_strong.any():
+                    low_dampen[low_strong] = Z_DAMPEN_STRONG
+                if low_weak.any():
+                    t_low = (low_descend_prob[low_weak] - Z_DESCEND_THRESHOLD_LOW) / (Z_DESCEND_THRESHOLD_HIGH - Z_DESCEND_THRESHOLD_LOW)
+                    low_dampen[low_weak] = Z_DAMPEN_WEAK + (1.0 - Z_DAMPEN_WEAK) * t_low
+
+                if Z_TREND_ENABLED or Z_UNCERTAINTY_ENABLED or Z_MAGNITUDE_ENABLED:
+                    low_boost = torch.zeros_like(low_dampen)
+
+                    if Z_TREND_ENABLED:
+                        z_info = self.compute_z_trend(hist, window=Z_TREND_WINDOW)
+                        low_boost = low_boost + torch.where(
+                            z_info['is_descending'],
+                            torch.full_like(low_dampen, Z_TREND_DAMPEN_BOOST),
+                            torch.zeros_like(low_dampen)
+                        )
+
+                    if Z_UNCERTAINTY_ENABLED:
+                        z_logvar_low = out_low['uncertainty'][:, :, 2]
+                        z_mean_logvar_low = z_logvar_low.mean(dim=1)
+                        low_uncertainty_low = z_mean_logvar_low < Z_UNCERTAINTY_THRESH
+                        low_boost = low_boost + torch.where(
+                            low_uncertainty_low,
+                            torch.full_like(low_dampen, Z_UNCERTAINTY_BOOST),
+                            torch.zeros_like(low_dampen)
+                        )
+
+                    if Z_MAGNITUDE_ENABLED:
+                        low_mag_thresh = Z_MAGNITUDE_THRESH * 0.5
+                        pred_z_final_low = out_low['predictions'][:, -1, 2]
+                        large_descent_low = pred_z_final_low < -low_mag_thresh
+                        low_boost = low_boost + torch.where(
+                            large_descent_low,
+                            torch.full_like(low_dampen, Z_MAGNITUDE_BOOST),
+                            torch.zeros_like(low_dampen)
+                        )
+
+                    low_dampen = torch.clamp(low_dampen + low_boost, 0.0, 1.0)
+
+                low_apply = low_dampen < 1.0
+                if low_apply.any():
+                    out_low['predictions'][low_apply, :, 2] *= low_dampen[low_apply].view(-1, 1)
 
             # 熵引导物理融合
             if ENTROPY_PHYSICS_ENABLED:
