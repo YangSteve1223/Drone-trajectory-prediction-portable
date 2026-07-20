@@ -62,6 +62,13 @@ Z_MAGNITUDE_THRESH = 5.0         # predicted Z displacement < -5m -> possibly re
 Z_MAGNITUDE_BOOST = 0.15         # dampen boost for large descent
 
 # Entropy-guided physics fusion: LOW model leans on physics extrapolation when intent is uncertain
+
+# Long trajectory fix: reduce physics gate inertia for trajectories >= 150 frames.
+# The physics model does linear extrapolation and fails on hovering turns.
+# Scaling gate_inertia down gives the neural decoder more weight (70% vs 29%).
+LONG_TRAJ_THRESHOLD = 150        # frame count threshold for activation
+LONG_TRAJ_GATE_SCALE = 0.3       # scale gate_inertia output (0.71 -> 0.21 effective)
+LONG_TRAJ_HIST_STRIDE = 2        # downsample history: every 2nd frame -> 8s context
 ENTROPY_PHYSICS_ENABLED = False  # disabled: physics model too simple, hurts turn accuracy
 ENTROPY_THRESHOLD = 0.4         # intent entropy > 0.4 triggers physics bias
 ENTROPY_MAX_BLEND = 0.35        # max extra physics weight
@@ -87,7 +94,11 @@ class DronePredictor:
         self._stats = {'low': 0, 'high': 0, 'n': 0}
 
     def _load(self, filename, n_classes):
+        # Prefer fine-tuned variant if available
         path = _WEIGHT_DIR / filename
+        ft_path = _WEIGHT_DIR / filename.replace('.pth', '_finetuned.pth')
+        if ft_path.exists():
+            path = ft_path
         model = TrajectoryPredictor(
             input_dim=6, history_len=20, pred_len=20,
             d_model=128, d_state=16, d_conv=4, expand=2,
@@ -358,6 +369,52 @@ class DronePredictor:
             'speed': speed,
             'route': route_list,
         }
+
+    @staticmethod
+    def make_long_windows(traj, hist_len=20, pred_len=20, stride=LONG_TRAJ_HIST_STRIDE):
+        """Create downsampled windows for long trajectories.
+
+        Downsampling provides extended temporal context (8s vs 4s) using the
+        same 20-frame window budget. Applied when trajectory >= LONG_TRAJ_THRESHOLD.
+
+        Args:
+            traj: (N, 6) numpy array
+        Returns:
+            hists: list of (20, 6), futs: list of (20, 3) displacement targets
+        """
+        import numpy as np
+        n = traj.shape[0]
+        ml = hist_len * stride + pred_len
+        if n < ml:
+            return [], []
+        hists, futs = [], []
+        step = max(1, stride // 2)
+        for i in range(0, n - ml + 1, step):
+            indices = np.arange(i, i + hist_len * stride, stride)[:hist_len]
+            hists.append(traj[indices].copy())
+            fut_start = i + hist_len * stride
+            fut_abs = traj[fut_start:fut_start + pred_len, :3]
+            futs.append(fut_abs - traj[fut_start - 1, :3])
+        return hists, futs
+
+    def _set_gate_scale(self, scale):
+        """Temporarily modify physics gate inertia for LOW model inference."""
+        gate = self.low.ua_pgd.physics_gate
+        if not hasattr(gate, '_orig_forward'):
+            gate._orig_forward = gate.forward
+        orig = gate._orig_forward
+
+        def scaled_forward(last_encoded, intent_weights, step_encoding):
+            gi, ga, gc, gm, gme = orig(last_encoded, intent_weights, step_encoding)
+            return gi * scale, ga, gc, gm, gme
+
+        gate.forward = scaled_forward
+
+    def _restore_gate(self):
+        """Restore original physics gate forward."""
+        gate = self.low.ua_pgd.physics_gate
+        if hasattr(gate, '_orig_forward'):
+            gate.forward = gate._orig_forward
 
     @property
     def stats(self):

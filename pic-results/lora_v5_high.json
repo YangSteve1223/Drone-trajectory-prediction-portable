@@ -1,0 +1,36 @@
+{
+  "config": {
+    "lora_targets": [
+      [
+        "ua_pgd.feat_compress",
+        32
+      ],
+      [
+        "ua_pgd.neural_decoder.proj.0",
+        16
+      ],
+      [
+        "ua_pgd.neural_decoder.delta_head",
+        16
+      ]
+    ],
+    "head_targets": [
+      "ua_pgd.anchor_to_pos.2"
+    ],
+    "epochs": 20,
+    "restarts": 3,
+    "n_sample": 5000,
+    "n_test": 1000
+  },
+  "base_ade": 1.1616194248199463,
+  "lora_ade": 0.9140060544013977,
+  "base_fde": 3.624675989151001,
+  "lora_fde": 2.627084970474243,
+  "base_dir": 0.18655535578727722,
+  "lora_dir": 0.12608574330806732,
+  "ade_gain_pct": 21.316221237182617,
+  "fde_gain_pct": 27.522212982177734,
+  "dir_gain_pct": 32.413761138916016,
+  "fde_gain_rate": "890/1000",
+  "dir_gain_rate": "680/1000"
+}

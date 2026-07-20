@@ -118,6 +118,7 @@ class TrajectoryPredictor(nn.Module):
         intent_labels: Optional[torch.Tensor] = None,
         return_all: bool = False,
         force_predict: bool = False,
+        context_injection: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -177,7 +178,8 @@ class TrajectoryPredictor(nn.Module):
             global_anchor=global_anchor,
             historical_trajectory=h,
             intent_weights=intent_weights,
-            return_uncertainty=True
+            return_uncertainty=True,
+            context_injection=context_injection,
         )
         predictions = pgd_out['predictions']            # (B, pred_len, 3) — normalized space
         uncertainties = pgd_out['logvar']

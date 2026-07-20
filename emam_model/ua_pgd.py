@@ -108,9 +108,11 @@ class PhysicsInertiaGate(nn.Module):
         nn.init.xavier_uniform_(self.gate_mlp[0].weight)
         nn.init.zeros_(self.gate_mlp[0].bias)
         nn.init.xavier_uniform_(self.gate_mlp[2].weight)
-        # Init gate_inertia high (~0.6), gate_anchor moderate (~0.3)
+        # Init gate_inertia neutral (~0.5), gate_anchor moderate (~0.3)
+        # Lower gate_inertia gives neural decoder more weight in the blend,
+        # critical for turn prediction where linear physics extrapolation fails.
         with torch.no_grad():
-            self.gate_mlp[2].bias.copy_(torch.tensor([0.6, 0.3]))
+            self.gate_mlp[2].bias.copy_(torch.tensor([0.0, 0.3]))
 
     def forward(
         self,
@@ -625,6 +627,7 @@ class UncertaintyAwarePGD(nn.Module):
         historical_trajectory: torch.Tensor,  # (B, T, 6)
         return_uncertainty: bool = True,
         intent_weights: Optional[torch.Tensor] = None,  # (B, num_intent_classes)
+        context_injection: Optional[torch.Tensor] = None,  # (B, d_model) adapter output
     ) -> Dict[str, torch.Tensor]:
         """
         Main forward pass.
@@ -658,6 +661,10 @@ class UncertaintyAwarePGD(nn.Module):
         last_encoded = encoded_feat[:, -1, :]                       # (B, d_model)
         last_encoded = self.feat_compress(last_encoded)           # (B, d_model)
         last_encoded = self.dropout(last_encoded)
+
+        # Inject long-context adapter output (adds 12s context to 4s window)
+        if context_injection is not None:
+            last_encoded = last_encoded + context_injection
 
         # -------------------------------------------------------------------------
         # 3. Project global anchor to position target
