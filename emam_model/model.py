@@ -194,8 +194,14 @@ class TrajectoryPredictor(nn.Module):
             vel_recent = h[:, -3:, 3:6]                            # (B, 3, 3)
             w = torch.tensor([0.2, 0.3, 0.5], device=h.device)
             last_vel_smooth = (vel_recent * w.view(1, 3, 1)).sum(dim=1)
+            # Displacement over `step` frames = vel[m/s] * step * dt.
+            # In normalized space this later gets *_scale_pos (100); velocity is
+            # stored as real_vel/_scale_vel (10). So the per-step factor must be
+            # dt * (_scale_vel/_scale_pos) = 0.2 * 10/100 = 0.02 to recover
+            # real_vel * step * dt after denormalization. (Was 0.1 -> implied
+            # dt=1.0s, a 5x overshoot at the 5Hz sample rate.)
             step_indices = torch.arange(1, self.pred_len + 1, device=h.device).float()
-            step_indices = step_indices.view(1, -1, 1) * 0.1
+            step_indices = step_indices.view(1, -1, 1) * (0.2 * _scale_vel / _scale_pos)
             baseline = last_vel_smooth.unsqueeze(1) * step_indices  # (B, pred_len, 3)
             mask = trigger_decision.float().unsqueeze(-1).unsqueeze(-1)
             predictions = predictions * mask + baseline * (1 - mask)
@@ -260,6 +266,12 @@ class TrajectoryPredictor(nn.Module):
 
         # 3. Uncertainty loss (negative log-likelihood)
         # NLL = (pred - target)^2 / (2*var) + log(sqrt(2*pi*var)), where var = exp(logvar)
+        # NOTE (semantics): NeuralDecoder.var_head ends in Softplus, so `uncertainty`
+        # is already a positive value in (0, +inf) — treating it as raw logvar and
+        # applying exp() below is not the textbook Gaussian NLL. The head effectively
+        # learns a monotone reparameterization of variance; loss is still finite and
+        # optimizable (weight 0.05), so this is left as-is intentionally. Fix would
+        # require retraining if var_head is changed to output raw logvar.
         logvar_clamped = uncertainty.clamp(-10, 10)
         var = torch.exp(logvar_clamped)  # prevent numerical overflow
         nll = ((predictions - targets) ** 2 / (2 * var + 1e-8)

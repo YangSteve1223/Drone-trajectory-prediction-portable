@@ -1,0 +1,21 @@
+{
+  "base_model": "high_speed_4class.pth",
+  "expanded": "E:\\Desktop\\TASKS AND WORK\\Drone-trajectory-prediction\\Drone-trajectory-prediction-portable\\weights\\high_speed_4class_40frame.pth",
+  "train_windows": 7337,
+  "test_windows": 1466,
+  "b20": {
+    "ade": 3.1501975059509277,
+    "fde": 11.395360946655273,
+    "dir": 0.39872711359321217,
+    "cata": 0.0,
+    "gap": 13.302489280700684
+  },
+  "f40": {
+    "ade": 4.617315769195557,
+    "fde": 17.472301483154297,
+    "dir": 1.0351254176729616,
+    "cata": 0.0,
+    "gap": 13.083090782165527
+  },
+  "fde_gain_pct": -53.328197017600445
+}

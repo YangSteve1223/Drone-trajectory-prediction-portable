@@ -24,6 +24,19 @@ try:
 except ImportError:
     _HAS_MAMBA_SSM = False
 
+# Fallback SSM scan implementation when mamba-ssm is unavailable.
+#   'loop'    = serial Python loop (default; robust across batch sizes).
+#   'chunked' = parallel segment-sum scan. Numerically equivalent (validated by
+#               test_ssm_scan.py: fwd max 1.5e-5, grad max 2e-4). It is ~4x
+#               faster for long sequences (T>=80) but the O(L^2 * d_state)
+#               segment-sum matrix becomes memory-bound at large batch: it wins
+#               at B=32/T=40 (1.17x) yet loses at B=64/T=40 (0.80x). Since the
+#               training configs use T<=40 and batch 32-64, 'loop' is the safer
+#               default; enable 'chunked' only for long-horizon workloads.
+import os as _os
+_SSM_FALLBACK = _os.environ.get('EMAM_SSM_FALLBACK', 'loop').lower()
+_SSM_CHUNK_SIZE = int(_os.environ.get('EMAM_SSM_CHUNK', '4'))
+
 
 def silu(x: torch.Tensor) -> torch.Tensor:
     """SiLU (Sigmoid Linear Unit): x * sigmoid(x)"""
@@ -124,12 +137,17 @@ class SelectiveSSM(nn.Module):
                     UserWarning, stacklevel=2
                 )
             with torch.amp.autocast('cuda', enabled=False):
-                y = _selective_ssm_scan(
+                _scan_fn = (_selective_ssm_scan_chunked if _SSM_FALLBACK == 'chunked'
+                            else _selective_ssm_scan)
+                _scan_kwargs = ({'chunk_size': _SSM_CHUNK_SIZE}
+                                if _SSM_FALLBACK == 'chunked' else {})
+                y = _scan_fn(
                     x_act.float() if x_act.dtype == torch.float16 else x_act,
                     dt,
                     A_neg,
                     self.D,
                     self.d_state,
+                    **_scan_kwargs,
                 )
             if x.dtype == torch.float16:
                 y = y.half()
@@ -221,6 +239,80 @@ def _selective_ssm_scan(
         h.mul_(A_d).add_(x_t.unsqueeze(-1))
         output[:, t, :] = h.sum(dim=-1) + D_vec_b * x_t
     return output
+
+
+def _selective_ssm_scan_chunked(
+    x_act,      # (B, T, d_inner)
+    dt,         # (B, T, d_inner)  softplus output, always > 0
+    A_mat,      # (d_inner, d_state)  -exp(A_log), always < 0
+    D_vec,      # (d_inner,)
+    d_state,
+    chunk_size: int = 16,
+):
+    """Chunked parallel selective SSM scan — numerically equivalent to the
+    Python-loop scan, but with sequential depth T/chunk_size instead of T.
+
+    The recurrence  h_t = a_t ⊙ h_{t-1} + x_t   (a_t = exp(dt_t * A) ∈ (0,1])
+    is a first-order linear recurrence. Within a chunk we solve it in parallel:
+
+        Let  P_t = prod_{k=1..t} a_k   (cumulative decay inside the chunk).
+        Then h_t = P_t ⊙ h_prev + P_t ⊙ cumsum_t( x_k / P_k )
+
+    Division by the cumulative product is avoided by doing the intra-chunk
+    weighted cumulative sum in log-space via a subtraction trick that stays
+    bounded: because a_k ∈ (0,1], log P is non-positive and monotonically
+    decreasing, so (log P_t - log P_k) ≤ 0 for k ≤ t and exp(...) ∈ (0,1].
+    Chunk boundaries carry the true state h forward serially.
+    """
+    B, T, d_inner = x_act.shape
+    device = x_act.device
+    dtype = torch.float32
+
+    dt = dt.clamp(min=1e-6, max=50.0)
+
+    # log a_t = dt_t * A  (≤ 0 since A < 0). Shape (B, T, d_inner, d_state)
+    log_a = (dt.unsqueeze(-1) * A_mat.view(1, 1, d_inner, d_state)).clamp(-50.0, 50.0)
+
+    D_vec_b = D_vec.view(1, 1, d_inner)
+    h_prev = torch.zeros(B, d_inner, d_state, device=device, dtype=dtype)
+    outputs = []
+
+    for c0 in range(0, T, chunk_size):
+        c1 = min(c0 + chunk_size, T)
+        L = c1 - c0
+        la = log_a[:, c0:c1]                       # (B, L, d_inner, d_state)
+        xc = x_act[:, c0:c1]                        # (B, L, d_inner)
+
+        # Cumulative log decay within chunk: logP_t = sum_{k<=t} log a_k  (≤ 0)
+        logP = torch.cumsum(la, dim=1)             # (B, L, d_inner, d_state)
+
+        # --- Intra-chunk contribution via stable segment-sum matrix ---
+        #   s_t = sum_{k<=t} exp(logP_t - logP_k) * x_k
+        # decay[t,k] = exp(logP_t - logP_k). Since logP is monotonically
+        # decreasing (cumsum of non-positive log_a), logP_t - logP_k ≤ 0 for
+        # t ≥ k, so exp(...) ∈ (0,1] — no overflow. Upper triangle is masked out.
+        logP_t = logP.unsqueeze(2)                 # (B, L, 1, d_inner, d_state)
+        logP_k = logP.unsqueeze(1)                 # (B, 1, L, d_inner, d_state)
+        decay = logP_t - logP_k                    # (B, L, L, d_inner, d_state)
+        causal = torch.tril(torch.ones(L, L, device=device, dtype=torch.bool))
+        decay = decay.masked_fill(~causal.view(1, L, L, 1, 1), float('-inf'))
+        decay = torch.exp(decay)                   # (B, L, L, d_inner, d_state), ∈ [0,1]
+
+        # intra_t = sum_k decay[t,k] * x_k  (x broadcast over d_state)
+        x_k = xc.unsqueeze(1).unsqueeze(-1)        # (B, 1, L, d_inner, 1)
+        intra = (decay * x_k).sum(dim=2)           # (B, L, d_inner, d_state)
+
+        # Carry-in from previous chunk state: exp(logP_t) ⊙ h_prev
+        carry = torch.exp(logP) * h_prev.unsqueeze(1)  # (B, L, d_inner, d_state)
+
+        h_chunk = carry + intra                    # (B, L, d_inner, d_state)
+
+        y = h_chunk.sum(dim=-1) + D_vec_b * xc     # (B, L, d_inner)
+        outputs.append(y)
+
+        h_prev = h_chunk[:, -1]                    # (B, d_inner, d_state) true state at c1-1
+
+    return torch.cat(outputs, dim=1)               # (B, T, d_inner)
 
 
 class SEChannelAttention(nn.Module):

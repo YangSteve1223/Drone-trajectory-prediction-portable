@@ -84,9 +84,13 @@ class DronePredictor:
     speed >= S_THRESHOLD -> high model (SimCruise, 4-class, 1Hz, 8-28 m/s domain)
     """
 
-    def __init__(self, threshold=S_THRESHOLD, device=None):
+    def __init__(self, threshold=S_THRESHOLD, device=None, use_finetuned=False):
         self.threshold = threshold
         self.device = torch.device(device) if device else _DEVICE
+        # use_finetuned: opt in to the *_finetuned.pth variant. Default False —
+        # the finetuned LOW model overfits to long trajectories and degrades the
+        # general case, so it must not load silently (see project memory).
+        self.use_finetuned = use_finetuned
 
         self.low = self._load('low_speed_6class.pth', 6)
         self.high = self._load('high_speed_4class.pth', 4)
@@ -94,10 +98,10 @@ class DronePredictor:
         self._stats = {'low': 0, 'high': 0, 'n': 0}
 
     def _load(self, filename, n_classes):
-        # Prefer fine-tuned variant if available
         path = _WEIGHT_DIR / filename
+        # Only use the fine-tuned variant when explicitly requested.
         ft_path = _WEIGHT_DIR / filename.replace('.pth', '_finetuned.pth')
-        if ft_path.exists():
+        if self.use_finetuned and ft_path.exists():
             path = ft_path
         model = TrajectoryPredictor(
             input_dim=6, history_len=20, pred_len=20,

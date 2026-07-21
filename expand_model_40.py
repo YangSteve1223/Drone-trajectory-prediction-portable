@@ -77,6 +77,37 @@ def make_adaptive_windows(traj, hist_len=40):
     return hists, futs
 
 
+def make_paired_windows(traj, stride40=2):
+    """Paired 20-frame and 40-frame windows anchored at the SAME last-observed
+    frame, predicting the SAME future — for a fair 20 vs 40 comparison.
+
+    - 20-frame history: frames [j-19 .. j] (stride 1), like make_raw_windows_20.
+    - 40-frame history: frames [j-39*stride40 .. j] (stride40), real trajectory
+      samples (no zero-velocity padding). Requires j >= 39*stride40.
+    - future: absolute positions [j+1 .. j+PRED_LEN] minus position at j.
+    Only anchors where BOTH histories fit are kept, so the two models are scored
+    on an identical window set.
+    """
+    n = traj.shape[0]
+    span40 = 39 * stride40                     # frames back needed for 40-frame hist
+    j_start = max(19, span40)                  # need 20-frame and 40-frame history
+    h20s, h40s, futs = [], [], []
+    for j in range(j_start, n - PRED_LEN):
+        # 20-frame history ending at j
+        h20 = traj[j - 19:j + 1].copy()        # (20, 6)
+        # 40-frame strided history ending at j
+        idx40 = np.arange(j - span40, j + 1, stride40)[:40]
+        if len(idx40) < 40:
+            continue
+        h40 = traj[idx40].copy()               # (40, 6)
+        fut_abs = traj[j + 1:j + 1 + PRED_LEN, :3]
+        if fut_abs.shape[0] < PRED_LEN:
+            continue
+        fut = fut_abs - traj[j, :3]
+        h20s.append(h20); h40s.append(h40); futs.append(fut)
+    return h20s, h40s, futs
+
+
 def make_raw_windows_20(traj):
     """Original 20-frame stride=1 windows (for baseline comparison)."""
     n = traj.shape[0]; ml = 20 + 20
@@ -176,18 +207,21 @@ def main():
     tr_data, val_data = all_windows[:n_tr], all_windows[n_tr:]
     print(f'  Train: {len(tr_data)}  Val: {len(val_data)}')
 
-    # Test: ALL windows from held-out long trajectories (exhaustive, no sampling bias)
-    te_data_20 = []
+    # Test: PAIRED windows from held-out long trajectories. 20-frame and
+    # 40-frame histories share the same anchor and predict the same future,
+    # so the comparison is apples-to-apples (no zero-velocity padding).
+    te_h20_list, te_h40_list, te_fut_list = [], [], []
     for traj, _ in test_trajs:
-        hists, futs = make_raw_windows_20(traj)
-        for h, f in zip(hists, futs):
-            te_data_20.append((torch.from_numpy(h).float(), torch.from_numpy(f).float()))
-    print(f'  20-frame test: {len(te_data_20)} windows (exhaustive, HELD-OUT long trajs)')
+        h20s, h40s, futs = make_paired_windows(traj, stride40=2)
+        te_h20_list.extend(h20s); te_h40_list.extend(h40s); te_fut_list.extend(futs)
+    te_h20 = torch.from_numpy(np.stack(te_h20_list)).float()   # (N, 20, 6)
+    te_h40 = torch.from_numpy(np.stack(te_h40_list)).float()   # (N, 40, 6)
+    te_t20 = torch.from_numpy(np.stack(te_fut_list)).float()   # (N, PRED_LEN, 3)
+    te_fut_np = te_t20.numpy()
+    print(f'  Paired test: {len(te_h20)} windows (HELD-OUT long trajs, real 40-frame history)')
 
     # ── Evaluate 20-frame baseline ──
     print('\n[4/5] Baseline evaluation...')
-    te_h20 = torch.stack([d[0] for d in te_data_20])
-    te_t20 = torch.stack([d[1] for d in te_data_20])
     base_preds_20 = []
     for b in range(0, len(te_h20), BATCH_SIZE):
         be = min(b+BATCH_SIZE, len(te_h20))
@@ -196,10 +230,10 @@ def main():
             base_preds_20.append(model_20(hb, force_predict=True)['predictions'].cpu())
     base_preds_20 = torch.cat(base_preds_20, dim=0)
     b20_fde = float(torch.norm(base_preds_20[:,-1,:]-te_t20[:,-1,:], dim=-1).mean())
-    b20_dir = float(np.mean([dir_err(base_preds_20[i,-1,:2].numpy(), te_data_20[i][1][-1,:2].numpy())
-                             for i in range(len(te_data_20))]))
-    b20_cata = float(np.sum([dir_err(base_preds_20[i,-1,:2].numpy(), te_data_20[i][1][-1,:2].numpy()) >= 90
-                             for i in range(len(te_data_20))]) / len(te_data_20) * 100)
+    b20_dir = float(np.mean([dir_err(base_preds_20[i,-1,:2].numpy(), te_fut_np[i][-1,:2])
+                             for i in range(len(te_h20))]))
+    b20_cata = float(np.sum([dir_err(base_preds_20[i,-1,:2].numpy(), te_fut_np[i][-1,:2]) >= 90
+                             for i in range(len(te_h20))]) / len(te_h20) * 100)
     b20_gap = float(np.linalg.norm(base_preds_20[:,0,:].numpy(), axis=1).mean())
     print(f'  20-frame (original) on long trajs: FDE={b20_fde:.3f}m  Dir={b20_dir:.1f}deg  '
           f'Cata={b20_cata:.1f}%  Gap={b20_gap:.3f}m')
@@ -261,32 +295,21 @@ def main():
         model_40.load_state_dict(best_state)
     model_40.eval()
 
-    # Evaluate 40-frame model on the 20-frame test set (create 40-frame windows)
+    # Evaluate 40-frame model on the SAME paired windows (real 40-frame history)
     print('\nEvaluating 40-frame model on long trajectories...')
     te_preds_40 = []
-    for b in range(0, len(te_data_20), BATCH_SIZE):
-        be = min(b+BATCH_SIZE, len(te_data_20))
-        # Need to create 40-frame windows from the same trajectory positions
-        # For fair comparison, we use the same prediction target but double the history
-        hb_list = []
-        for i in range(b, be):
-            h20 = te_data_20[i][0].numpy()  # (20, 6)
-            # Pad with earlier frames from the trajectory
-            # Since we don't have the original traj, we replicate first frame with zero velocity
-            pad = np.tile(h20[0:1], (20, 1))
-            pad[:, 3:6] = 0  # zero velocity for padded frames
-            h40 = np.concatenate([pad, h20], axis=0)
-            hb_list.append(torch.from_numpy(h40).float())
-        hb = torch.stack(hb_list).to(DEVICE)
+    for b in range(0, len(te_h40), BATCH_SIZE):
+        be = min(b+BATCH_SIZE, len(te_h40))
+        hb = te_h40[b:be].to(DEVICE)
         with torch.no_grad():
             te_preds_40.append(model_40(hb, force_predict=True)['predictions'].cpu())
     te_preds_40 = torch.cat(te_preds_40, dim=0)
 
     f40_fde = float(torch.norm(te_preds_40[:,-1,:]-te_t20[:,-1,:], dim=-1).mean())
-    f40_dir = float(np.mean([dir_err(te_preds_40[i,-1,:2].numpy(), te_data_20[i][1][-1,:2].numpy())
-                              for i in range(len(te_data_20))]))
-    f40_cata = float(np.sum([dir_err(te_preds_40[i,-1,:2].numpy(), te_data_20[i][1][-1,:2].numpy()) >= 90
-                              for i in range(len(te_data_20))]) / len(te_data_20) * 100)
+    f40_dir = float(np.mean([dir_err(te_preds_40[i,-1,:2].numpy(), te_fut_np[i][-1,:2])
+                              for i in range(len(te_h40))]))
+    f40_cata = float(np.sum([dir_err(te_preds_40[i,-1,:2].numpy(), te_fut_np[i][-1,:2]) >= 90
+                              for i in range(len(te_h40))]) / len(te_h40) * 100)
     f40_gap = float(np.linalg.norm(te_preds_40[:,0,:].numpy(), axis=1).mean())
 
     # ── Report ──

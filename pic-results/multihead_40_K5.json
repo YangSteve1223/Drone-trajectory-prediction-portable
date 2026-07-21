@@ -1,0 +1,12 @@
+{
+  "K": 5,
+  "base": "low_speed_6class_40frame.pth",
+  "test_windows": 1783,
+  "single_ade": 0.497705252566367,
+  "single_fde": 0.873717051523827,
+  "min_ade": 0.40697045379385677,
+  "min_fde": 0.5975696766165054,
+  "fde_gain_pct": 31.606041615612305,
+  "baseline_single_fde": 0.8386190872257069,
+  "baseline_min_fde": 0.7309605746555591
+}
