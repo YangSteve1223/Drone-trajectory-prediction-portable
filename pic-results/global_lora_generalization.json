@@ -1,0 +1,26 @@
+{
+  "split": "flight-level (disjoint)",
+  "seed": 2025,
+  "n_train_flights": 15990,
+  "n_test_flights": 3997,
+  "n_train_windows": 9253,
+  "n_test_windows": 2628,
+  "base": {
+    "fde": 0.7576130628585815,
+    "ade": 0.38614505529403687,
+    "dir": 13.95072407234117,
+    "cata": 1.4840182648401825
+  },
+  "lora": {
+    "fde": 0.7023550271987915,
+    "ade": 0.400402694940567,
+    "dir": 13.313506605816634,
+    "cata": 1.67427701674277
+  },
+  "fde_gain_pct": 7.293701543541717,
+  "ade_gain_pct": -3.6923014942334103,
+  "dir_gain_pct": 4.567630061495439,
+  "window_level_fde_gain_pct": 19.4,
+  "generalization_gap_pts": 12.106298456458282,
+  "train_minutes": 11.18458122809728
+}

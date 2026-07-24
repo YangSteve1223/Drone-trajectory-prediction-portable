@@ -93,7 +93,9 @@ LoRA = **锦上添花**，不是雪中送炭。base 模型先把所有长度处�
 
 - **上游 targets（不含 delta_head）**：SSM in/out_proj + `ua_pgd.feat_compress` + `neural_decoder.proj.0`，头部只微调 `anchor_to_pos.2`，约 100K 参数。
 - **为何排除 delta_head**：它逐步独立处理 20 个预测步，LoRA 作用其上会放大步间差异 → 锯齿轨迹。
-- **全局 LoRA**：`dir_lora_40.pth`（当前最佳，方向加权训练，FDE +19.4%，方向误差 13.8°→12.1°）。
+- **全局 LoRA**：`dir_lora_40.pth`（当前最佳，方向加权训练）。
+  - window-level 划分：FDE +19.4%，方向误差 13.8°→12.1°（同飞行窗口可能同现于训练/测试，偏乐观）。
+  - **跨飞行划分（诚实泛化，20% 飞行完全留出）：FDE +7.3%，方向 +4.6%**（`eval/eval_global_lora_generalization.py`）。真实部署应以此为准。
 - **叠加**：40 帧 base → 合并全局 LoRA → 逐无人机在线 LoRA。
 
 ### 在线持续学习
@@ -172,8 +174,10 @@ K=5 独立预测头 + 置信度评分头，Winner-Takes-All 训练。推理取�
 | `viz/diagnose_failures.py` | 最差样本深度诊断 |
 | `viz/rollout.py` | 自回归预测外推 |
 | `fix_labels.py` | UAV-Flow 标签修正（根目录） |
+| `eval/eval_global_lora_generalization.py` | 全局 LoRA 跨飞行泛化验证（飞行级不相交划分） |
 | `tests/test_deploy_gates.py` | 部署三门控 + 在线学习常驻 adapter 回归测试 |
 | `tests/test_ssm_scan.py` | chunked SSM scan 数值等价性测试 |
+| `tests/benchmark_latency.py` | 推理延迟基准（两个入口 + 在线更新） |
 
 > 所有脚本都从**项目根目录**运行（如 `python eval/evaluate.py`），脚本内部会自动定位根目录以加载 `weights/` 与数据集。
 
@@ -202,6 +206,23 @@ K=5 独立预测头 + 置信度评分头，Winner-Takes-All 训练。推理取�
 | LOW FDE | 0.648m | 0.638m | +1.6% (21/30 drones) |
 | HIGH FDE | 4.28m | 4.06m | +5.1% (25/25 drones) |
 
+### 全局 LoRA 泛化性（诚实评估）
+
+| 划分方式 | FDE 增益 | 方向增益 | 说明 |
+|:--|:--:|:--:|:--|
+| window-level（旧） | +19.4% | +12.3% | 同飞行窗口可能同现于训练/测试，偏乐观 |
+| **跨飞行（20% 飞行留出）** | **+7.3%** | **+4.6%** | held-out 飞行从未见过，**部署以此为准** |
+
+### 推理延迟（RTX 3060 Laptop, batch=1, 单无人机流）
+
+| 调用路径 | mean | p50 | p95 | 吞吐 |
+|:--|:--:|:--:|:--:|:--:|
+| `DronePredictor.predict` (20f) | 35.3 ms | 34.2 ms | 44.2 ms | 28 fps |
+| `DeployedLowPredictor.predict` (40f, 仅推理) | 20.1 ms | 18.9 ms | 27.3 ms | 50 fps |
+| `DeployedLowPredictor.predict` (40f, 含在线更新) | 30.3 ms | 19.9 ms | 117.9 ms | 33 fps |
+
+> 实时裕量：LOW 5Hz（200ms/帧）有 ~10× 裕量，HIGH 1Hz（1000ms/帧）有 ~50× 裕量。在线更新的 p95 尖峰来自每 10 帧触发一次的 LoRA 更新，仍远低于帧预算。
+
 ## 模型规格
 
 - 参数量：~1.4M / 模型 (d_model=128, d_state=16)
@@ -215,8 +236,8 @@ K=5 独立预测头 + 置信度评分头，Winner-Takes-All 训练。推理取�
 - **LOW 方向误差**仍高于 HIGH，多假设 + dir_lora 已改善，仍有空间。
 - **极端转弯 (>150°)**：需架构级改动，gate_lora 只能缓解。
 - **物理模型 2 帧速度种子**：曾试多帧最小二乘种子，验证为负收益（已否决，勿重试）。
-- **全局 LoRA 泛化性**：训练用 window-level split，+19.4% 偏乐观，跨数据集未验证；架构支持一键关闭以应对 OOD。
-- 单元测试覆盖较薄（仅 `test_ssm_scan.py` + 各模块 `__main__` 冒烟块）。
+- **全局 LoRA 泛化性**：已用跨飞行划分诚实验证，held-out 飞行 FDE +7.3%（window-level +19.4% 偏乐观）；架构支持一键关闭以应对 OOD。
+- 测试覆盖：门控/在线学习/SSM 有回归测试 + 延迟基准，predictor 软融合与 40 帧扩展尚无专门回归测试。
 
 ## 许可
 
