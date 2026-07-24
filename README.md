@@ -143,6 +143,8 @@ K=5 独立预测头 + 置信度评分头，Winner-Takes-All 训练。推理取�
 
 > 从根目录运行，例如 `python eval/evaluate.py`、`python tests/test_deploy_gates.py`。
 
+**文档：** `README.md`（本文，架构与结果）、`INTERFACE.md`（系统集成接口规范 / ICD）、`ROADMAP.md`（多无人机交互预测下一步规划）。
+
 ## 权重文件 (`weights/`)
 
 | 文件 | 说明 |
