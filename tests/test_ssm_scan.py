@@ -8,7 +8,8 @@ Pass criteria (both must hold to adopt the chunked version):
   2. Backward gradients (w.r.t. x_act, dt, A, D) match within tolerance.
   3. Chunked is faster on the real model's typical shapes (T=20 and T=40).
 
-Run: python test_ssm_scan.py
+Run standalone:  python test_ssm_scan.py
+Run via pytest:  pytest test_ssm_scan.py -v
 """
 import time
 import torch
@@ -17,6 +18,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from emam_model.emam_se import _selective_ssm_scan, _selective_ssm_scan_chunked
+
+try:
+    import pytest
+    HAS_PYTEST = True
+except ImportError:
+    HAS_PYTEST = False
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.manual_seed(0)
@@ -31,7 +38,7 @@ def make_inputs(B, T, d_inner, d_state, device):
     return x_act, dt, A_mat, D_vec
 
 
-def test_equivalence(B, T, d_inner, d_state, chunk_size):
+def _check_equivalence(B, T, d_inner, d_state, chunk_size):
     x_act, dt, A_mat, D_vec = make_inputs(B, T, d_inner, d_state, DEVICE)
 
     # --- Forward equivalence ---
@@ -101,6 +108,41 @@ def bench_shape(B, T, d_inner, d_state, chunk_size):
     return t_loop, t_chunk
 
 
+if not HAS_PYTEST:
+    # Dummy parametrize so standalone `python test_ssm_scan.py` works without pytest
+    class _DummyPytest:
+        @staticmethod
+        def mark_parametrize(*args, **kwargs):
+            return lambda fn: fn
+    _dummy = _DummyPytest()
+
+# ---- pytest-compatible wrappers ----
+# Run via `pytest test_ssm_scan.py -v` or standalone `python test_ssm_scan.py`
+
+if HAS_PYTEST:
+    _param = pytest.mark.parametrize
+else:
+    _param = _dummy.mark_parametrize
+
+@_param('B,T', [(1,20),(4,20),(8,20),(8,40),(16,40),(4,80),(2,150)])
+def test_chunked_scan_equivalence(B, T):
+    """Pytest entry: forward+backward equivalence at 1e-4 tolerance."""
+    d_inner, d_state = 256, 16
+    chunk = 16
+    fwd_ok, fwd_max, grad_ok, grad_max = _check_equivalence(B, T, d_inner, d_state, chunk)
+    assert fwd_ok, f'Forward mismatch: max {fwd_max:.2e}'
+    assert grad_ok, f'Backward mismatch: max {grad_max:.2e}'
+
+@_param('B,T', [(16,40),(8,80),(4,150)])
+def test_chunked_scan_speedup(B, T):
+    """Pytest entry: chunked scan >= 1.0x of loop for large-T shapes where it should win.
+    Small B/T (32,20 etc.) excluded: chunking overhead dominates, loop wins there."""
+    d_inner, d_state = 256, 16
+    chunk = 16
+    t_loop, t_chunk = bench_shape(B, T, d_inner, d_state, chunk)
+    speedup = t_loop / t_chunk
+    assert speedup >= 1.0, f'Chunked regressed at T={T}: speedup {speedup:.2f}x (loop {t_loop:.1f}ms chunk {t_chunk:.1f}ms)'
+
 if __name__ == '__main__':
     print(f'Device: {DEVICE}')
     CHUNK = 16
@@ -110,7 +152,7 @@ if __name__ == '__main__':
     print('\n=== Equivalence (forward + backward) ===')
     all_ok = True
     for B, T in [(8, 20), (8, 40), (16, 40), (4, 80), (2, 150)]:
-        fwd_ok, fwd_max, grad_ok, grad_max = test_equivalence(B, T, d_inner, d_state, CHUNK)
+        fwd_ok, fwd_max, grad_ok, grad_max = _check_equivalence(B, T, d_inner, d_state, CHUNK)
         status = 'OK' if (fwd_ok and grad_ok) else 'FAIL'
         all_ok = all_ok and fwd_ok and grad_ok
         print(f'  B={B:2d} T={T:3d}: fwd {"OK " if fwd_ok else "FAIL"}(max {fwd_max:.2e}) '
