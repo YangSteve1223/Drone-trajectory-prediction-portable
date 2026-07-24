@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""
-LoRA on 40-frame model — per-trajectory adaptation for long trajectories.
+"""LoRA evaluation on 40-frame model — per-trajectory adaptation for long trajectories.
 
-Base: 40-frame expanded model (low_speed_6class_40frame.pth)
-LoRA: v8.1 config (upstream-only, boundary continuity, physics loss)
-Goal: verify LoRA adds incremental value on an already-good base model (锦上添花).
+Base: low_speed_6class_40frame.pth. LoRA: v8.1 config (upstream-only).
 """
 
 import torch, numpy as np, sys, warnings, json, traceback

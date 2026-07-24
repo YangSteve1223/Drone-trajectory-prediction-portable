@@ -48,28 +48,8 @@ class OrthogonalStepEncoder(nn.Module):
 # ============================================================================
 
 class PhysicsInertiaGate(nn.Module):
-    """
-    Physical Inertia Gating.
-
-    Core idea: step output = physics extrapolation x inertia gate + neural prediction x (1 - inertia gate),
-    with an added anchor pull-back effect.
-
-    Four gates:
-        gate_inertia:    ratio of historical inertia to keep (0~1)
-                         - rises during maneuvers: follow abrupt actions
-                         - falls during cruise/hover: rely on model prediction
-        gate_anchor:     anchor pull-back strength (0~1)
-                         - stronger for farther steps, prevents long-horizon divergence
-        gate_confidence: model confidence (0~1), mapped from uncertainty
-                         - reduces neural weight under high uncertainty
-        gate_mode:       flight-mode modulation (0~1), mapped from intent weights
-                         - forces stronger anchor pull-back when hovering
-
-    Inputs: last-step encoded feature (B, d_model)
-            intent weights (B, num_intent_classes)
-            step encoding (pred_len, d_model)
-    Output: gate parameter sequence (B, pred_len, num_gates)
-    """
+    """Physical inertia gating: blends physics extrapolation with neural prediction via
+    four gates (inertia, anchor, confidence, mode)."""
     def __init__(self, d_model: int, num_intent_classes: int, pred_len: int):
         super().__init__()
         self.d_model = d_model
@@ -176,21 +156,13 @@ class PhysicsInertiaGate(nn.Module):
 # ============================================================================
 
 class KinematicPhysicsModel(nn.Module):
-    """
-    Kinematic Physics Model with decoupled degrees of freedom.
+    """Kinematic physics extrapolation with decoupled DOF for position/velocity/acceleration.
 
-    Models position/velocity/acceleration independently for physical consistency:
+    Serves as inductive bias, blended via inertia gate; not a hard constraint.
 
-    Position extrapolation: p_{t+dt} = p_t + v_t * dt + 0.5 * a_t * dt^2
-    Velocity extrapolation: v_{t+dt} = v_t + a_t * dt
-    Acceleration bound: |a| <= max_acc (typical drone value: 15 m/s^2)
-
-    Serves only as a strong inductive bias, blended in when the inertia gate is open; not a hard constraint.
-
-    NOTE (2026-07-24): a multi-frame least-squares velocity seed was tried and
-    REJECTED — it consistently hurt FDE/direction on UAV-Flow (agile low-speed
-    flight, where the most recent 2-frame velocity is the best predictor of the
-    next motion; multi-frame averaging lags on turns). Do not revisit.
+    NOTE: multi-frame least-squares velocity seed was tried and REJECTED — it hurt
+    FDE/direction on agile low-speed flight. The 2-frame finite-difference seed is
+    the best predictor. Do not revisit.
     """
     def __init__(self, trajectory_dim: int = 6, max_accel: float = 15.0):
         super().__init__()
@@ -463,14 +435,8 @@ class MultiHeadNeuralDecoder(nn.Module):
         confidences: torch.Tensor,      # (B, K)
         targets: torch.Tensor,          # (B, P, 3)
     ) -> Dict[str, torch.Tensor]:
-        """
-        Winner-Takes-All loss.
-
-        1. Compute the L2 error of each trajectory
-        2. Select the one with the smallest error as the winner
-        3. MSE loss is backpropagated only through the winner
-        4. Confidence loss uses cross-entropy (teaches the model which head is best)
-        """
+        """Winner-Takes-All loss: backprop MSE only through the best head,
+        plus cross-entropy confidence loss."""
         K, B, P, _ = deltas.shape
         device = deltas.device
 
@@ -509,12 +475,7 @@ class MultiHeadNeuralDecoder(nn.Module):
         deltas: torch.Tensor,           # (K, B, P, 3)
         targets: torch.Tensor,          # (B, P, 3)
     ) -> Dict[str, torch.Tensor]:
-        """
-        Compute minADE_K and minFDE_K:
-        for each sample, pick the trajectory with the smallest error among K and compute the metrics.
-
-        Standard multi-hypothesis evaluation metrics.
-        """
+        """Compute minADE_K and minFDE_K: pick the best trajectory per sample."""
         K, B, P, _ = deltas.shape
 
         # ADE and FDE per trajectory
@@ -544,32 +505,12 @@ class MultiHeadNeuralDecoder(nn.Module):
 # ============================================================================
 
 class UncertaintyAwarePGD(nn.Module):
-    """
-    Uncertainty-Aware Physics-Guided Decoder.
+    """Uncertainty-Aware Physics-Guided Decoder.
 
-    Overall flow::
-
-        encoded_feat ──────────────────────────────────┐
-                                                          │
-        global_anchor ──→ fuse with encoded ──┐          │
-                                           ↓             │
-        history ──→ kinematic physics model ─→ physics_delta ─→ ┴→ inertia-gate blend → neural residual → final displacement
-                                           ↑             │
-        step encoding ──────────────────────────────────┘
-
-    Blend formula::
+    Blends multi-step physics extrapolation with neural prediction via the inertia gate:
 
         pred[t] = gate_inertia[t] * physics_delta[t]
-                + (1 - gate_inertia[t]) * (neural_delta[t] + global_anchor_contribution)
-                + gate_mode[t] * anchor_pull[t]
-
-    where anchor_pull[t] = gate_anchor[t] * (global_anchor - current_pos)
-
-    Gate behavior:
-        - gate_inertia:  high during maneuvers, low during cruise, lower for far steps
-        - gate_anchor:   stronger for farther steps, forced up when hovering
-        - gate_mode:     mapped from intent weights, hover intent -> anchor dominates
-        - gate_confidence: mapped from uncertainty, high uncertainty -> stronger anchor pull-back
+                + (1 - gate_inertia[t]) * (neural_delta[t] + anchor_pull[t])
     """
 
     def __init__(
@@ -965,17 +906,7 @@ class UncertaintyAwarePGD(nn.Module):
         targets: torch.Tensor,
         gate_inertia: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Physics consistency loss: encourages predictions to stay close to physics extrapolation
-        in high-inertia regions (maneuvers) and close to the neural prediction in low-inertia regions (cruise).
-
-        loss = |pred - physics| * gate_inertia + |pred - neural| * (1 - gate_inertia)
-
-        Since neural_delta is unknown here, this is simplified to:
-        loss = |pred - physics| * gate_inertia.mean()
-
-        i.e., during maneuvers (high gate_inertia), force predictions to stay close to the physics model.
-        """
+        """Physics consistency loss: |pred - physics| weighted by gate_inertia."""
         residual = (predictions - physics_trajectory).abs()   # (B, P, 3)
         physics_loss = (residual * gate_inertia.unsqueeze(-1)).mean()
         return physics_loss * self.physics_loss_weight

@@ -15,7 +15,7 @@ Setup (single-flight, most realistic — each drone has one flight of data):
   - Compare on the SAME held-out windows:
         (A) FROZEN  = 40-frame base + merged global LoRA, no per-drone learning
         (B) ONLINE  = same base, with the per-drone LoRA learned during warmup
-  - Also record FDE vs #warmup-windows-seen (the "越飞越准" curve): re-evaluate
+  - Also record FDE vs #warmup-windows-seen: re-evaluate
     the held-out set after every few online updates.
 
 Outputs: pic-results/online_learning.json + online_learning.png
@@ -185,7 +185,7 @@ def main():
     ax2.set_ylabel('mean held-out FDE (m)')
     ax2.set_title('Frozen vs Online (mean)', fontsize=9, fontweight='bold')
 
-    # (3) "越飞越准": normalized heldout FDE vs online updates seen (avg over drones)
+    # (3) Normalized heldout FDE vs online updates seen (avg over drones)
     ax3 = fig.add_subplot(1, 3, 3)
     # align curves by update index, normalize each drone by its frozen FDE
     max_u = max((r['curve'][-1][0] for r in results if r['curve']), default=0)

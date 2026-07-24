@@ -22,10 +22,7 @@ class OnlineLearnerConfig:
     """Hyperparameters for online continual learning."""
 
     # Optimizer
-    # NOTE (2026-07-24): lr lowered 1e-4 -> 3e-5 and accumulation 5 -> 10 after
-    # the online-learning study: the aggressive default overfit the warmup segment
-    # and HURT held-out FDE (-8%); the gentler setting turns it net-positive and
-    # helps more drones. See eval_online_learning.py.
+    # lr 3e-5, accum 10: gentler config avoids warmup overfit (was 1e-4 / accum 5).
     lr: float = 3e-5
     weight_decay: float = 1e-5
     max_grad_norm: float = 1.0
@@ -37,8 +34,7 @@ class OnlineLearnerConfig:
     # Regularization
     lora_l2_penalty: float = 0.05
 
-    # Loss (aligned with the offline 40-frame LoRA: normalized Huber + direction
-    # + boundary continuity, instead of raw meter-scale MSE).
+    # Loss: normalized Huber + direction + boundary continuity
     scale_pos: float = 100.0
     dt: float = 0.2
     beta_huber: float = 0.20

@@ -1,10 +1,4 @@
-"""
-Evaluation metrics (per PPT definition):
-1. Distance error (RMSE/MSE)
-2. Distance accuracy: threshold 0.25 + pred_step * 0.15, capped at 1.5m
-3. Direction accuracy: fraction of samples with angle < 15 degrees
-4. Kinematic smoothness: Mean Jerk / Mean Accel / Max Accel
-"""
+"""Evaluation metrics: displacement error, distance accuracy, direction accuracy, kinematic smoothness."""
 
 import torch
 import torch.nn.functional as F

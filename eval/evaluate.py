@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-"""
-Comprehensive Evaluation Suite for Drone Trajectory Prediction.
-
-Metrics:
-  1. ADE (Average Displacement Error) — mean L2 over all prediction steps
-  2. FDE (Final Displacement Error)   — L2 at final step
-  3. Per-Intent Error Breakdown       — ADE/FDE by intent class
-  4. Direction Error                  — angular error (deg) between pred & true heading
-  5. Speed Profile Error              — RMSE of speed magnitude over time
-  6. Uncertainty Calibration          — binned logvar vs actual error
-
-Runs on both LOW (UAV-Flow) and HIGH (SimCruise) test sets.
-"""
+"""Evaluation suite: ADE, FDE, per-intent breakdown, direction error, speed profile, uncertainty calibration.
+Runs on both LOW (UAV-Flow) and HIGH (SimCruise) test sets."""
 
 import torch, numpy as np, sys
 from pathlib import Path

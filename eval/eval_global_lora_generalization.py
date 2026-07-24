@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
-"""
-Global LoRA — HONEST cross-flight generalization test.
+"""Global LoRA cross-flight generalization: flight-level (not window-level) train/test split.
 
-The production dir_lora_40 / global_lora_40 numbers (+19.4% / +14.9% FDE) were
-measured with a WINDOW-level split: all windows from all flights were pooled,
-shuffled, then split 85/15. Windows from the same flight therefore appear in
-BOTH train and test — the test set is not truly unseen, so the gain is optimistic.
-
-This script re-measures the gain the honest way:
-  1. Split FLIGHTS (npz files) into disjoint train / test sets (by file, seeded).
-  2. Train a global direction-LoRA on windows from TRAIN flights only.
-  3. Evaluate base vs LoRA on windows from TEST flights the LoRA never saw.
-
-Same B3 LoRA config / loss / turn-weighting as train_lora_direction.py, so the
-only thing that changes is the split. The delta between this gain and the
-window-level +19.4% is the generalization gap.
+Re-measures dir_lora_40 gain with FLIGHT-disjoint split (80/20, seed 2025).
+The production +19.4% is window-level and optimistic; this script gives the
+honest held-out-flight number to use for deployment reporting.
 
 Run from repo root:  python eval/eval_global_lora_generalization.py
 """

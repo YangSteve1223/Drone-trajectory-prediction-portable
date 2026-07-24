@@ -9,6 +9,9 @@ checkpoints/*/
 !checkpoints/bidir_enhancer.pth
 weights/online_adapters/
 
+# Project local config (AI-assisted, not part of the deliverable)
+CLAUDE.md
+
 # IDE
 .vscode/
 .idea/

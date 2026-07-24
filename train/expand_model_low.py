@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
-"""
-Model Expansion + Adaptive Stride Fine-Tuning (Non-LoRA Improvement)
-====================================================================
+"""20→40 frame model expansion with adaptive-stride fine-tuning.
 
-Root cause: 20-frame input (4s at 5Hz) is too small for long trajectories.
-Solution:
-  1. Expand model from history_len=20 to 40 (8s context at stride=1)
-  2. Adaptive stride: stride=4 for long trajs → 32s context from 40 frames
-  3. Fine-tune full model with mixed-stride data
-  4. 147/148 weights transfer directly from 20-frame checkpoint
-
-This is a clean, non-LoRA improvement that directly addresses the input
-bottleneck. LoRA can then stack on top for per-drone adaptation.
+147/148 weights transfer from 20-frame checkpoint; encoder frozen, decoder+gate
+fine-tuned. Adaptive stride: max(1, min(4, n//60)). Non-LoRA improvement.
 """
 
 import torch, numpy as np, sys, warnings, json, traceback

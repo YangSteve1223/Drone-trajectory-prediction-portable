@@ -62,13 +62,7 @@ class LoRALinear(nn.Module):
         return self.base_layer.bias
 
     def merge(self):
-        """Merge LoRA into base weights so the plain Linear reproduces the adapted output.
-
-        forward does y = x@W.T + (x@A@B)*scaling, with A:(in,r), B:(r,out).
-        nn.Linear stores W:(out,in) and computes x@W.T, so the equivalent weight
-        delta is (A@B).T * scaling  ->  shape (out,in). (The previous
-        (B@A.T).T formulation had mismatched shapes and never ran.)
-        """
+        """Merge LoRA into base weights: delta = (A@B).T * scaling."""
         delta = (self.lora_A.data @ self.lora_B.data).T * self.scaling   # (out, in)
         self.base_layer.weight.data += delta.to(self.base_layer.weight.dtype)
         self.lora_A.data.zero_()
@@ -80,17 +74,10 @@ class LoRALinear(nn.Module):
             self.base_layer.weight.data -= saved_delta.to(self.base_layer.weight.dtype)
 
 
-# Default target layers (upstream-only fallback for LoRAAdapter when the caller
-# passes no explicit targets — e.g. the smoke test below).
+# Default target layers — standalone fallback only. Production config lives in
+# online_config.ONLINE_LORA_TARGETS / ONLINE_HEAD_TARGETS.
 #
-# The AUTHORITATIVE production config lives in online_config.ONLINE_LORA_TARGETS /
-# ONLINE_HEAD_TARGETS; deploy.py / adapter_manager / online_learner all use that and
-# never fall back to these. These defaults are kept only so `create_lora_model(model)`
-# works standalone, and they intentionally mirror the validated upstream-only setup.
-#
-# NOTE: `ua_pgd.neural_decoder.delta_head` is deliberately EXCLUDED. The delta_head
-# processes each of the 20 prediction steps independently (ua_pgd.py), so adapting it
-# amplifies per-step differences and produces zigzag trajectories. Do not add it back.
+# NOTE: delta_head is deliberately excluded — adapting it causes zigzag trajectories.
 DEFAULT_LORA_TARGETS = [
     'emam_se.mamba_blocks.0.ssm.in_proj',
     'emam_se.mamba_blocks.0.ssm.out_proj',

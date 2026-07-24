@@ -265,13 +265,8 @@ class TrajectoryPredictor(nn.Module):
         loss_intent = F.cross_entropy(intent_logits, intent_labels)
 
         # 3. Uncertainty loss (negative log-likelihood)
-        # NLL = (pred - target)^2 / (2*var) + log(sqrt(2*pi*var)), where var = exp(logvar)
-        # NOTE (semantics): NeuralDecoder.var_head ends in Softplus, so `uncertainty`
-        # is already a positive value in (0, +inf) — treating it as raw logvar and
-        # applying exp() below is not the textbook Gaussian NLL. The head effectively
-        # learns a monotone reparameterization of variance; loss is still finite and
-        # optimizable (weight 0.05), so this is left as-is intentionally. Fix would
-        # require retraining if var_head is changed to output raw logvar.
+        # var_head ends in Softplus — output is positive but not strictly log(variance).
+        # Left as-is; changing the head would require retraining.
         logvar_clamped = uncertainty.clamp(-10, 10)
         var = torch.exp(logvar_clamped)  # prevent numerical overflow
         nll = ((predictions - targets) ** 2 / (2 * var + 1e-8)
