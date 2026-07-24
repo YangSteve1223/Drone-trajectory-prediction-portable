@@ -3,22 +3,22 @@
 A drone trajectory prediction system built on the EMAM (Enhanced Mamba) architecture. Key features:
 
 - **Speed-adaptive dual-model soft fusion** — LOW (real low-speed) + HIGH (simulated cruise)
-- **40-frame long-history extension** — long-trajectory FDE cut from 2.32m to 0.87m, catastrophic failures reduced to near zero
+- **40-frame long-history extension** — long-trajectory FDE cut from 2.32 m to 0.87 m, catastrophic failures reduced to near zero
 - **LoRA personalization** — global LoRA (icing on the cake) + per-drone LoRA (online learning)
 - **Multi-hypothesis prediction** — K=5 Winner-Takes-All, minFDE clearly outperforms the single-hypothesis model
 - **Online continual learning** — per-drone streaming incremental adaptation (positive gains verified on both LOW and HIGH)
 
-## 快速开始
+## Quick Start
 
 ```bash
 pip install -r requirements.txt
 ```
 
-系统有两个推理入口，按用途选择：
+The system has two inference entry points. Choose based on your use case:
 
-### 1. `DronePredictor` — 通用短程推理（20 帧输入）
+### 1. `DronePredictor` — General Short-Range Inference (20-frame input)
 
-带 Z 轴纠正 + 双模型软融合，适合一般实时预测。
+With Z-axis correction + dual-model soft fusion. Suitable for general real-time prediction.
 
 ```python
 import torch
@@ -26,221 +26,221 @@ from predictor import DronePredictor
 
 predictor = DronePredictor()
 
-# 输入: (B, 20, 6) — 20 帧历史, 每帧 [x,y,z, vx,vy,vz] (米, 米/秒)
+# Input: (B, 20, 6) — 20 history frames, each [x, y, z, vx, vy, vz] (meters, m/s)
 history = torch.randn(1, 20, 6)
 result = predictor.predict(history)
 
-result['predictions']    # (1, 20, 3) 未来位移 (米)
-result['intent_logits']  # 意图分类 logits
-result['speed']          # 当前速度 (m/s)
-result['route']          # 'LOW' | 'HIGH' 路由选择
+result['predictions']    # (1, 20, 3) future displacement (meters)
+result['intent_logits']  # intent classification logits
+result['speed']          # current speed (m/s)
+result['route']          # 'LOW' | 'HIGH' routing decision
 ```
 
-### 2. `DeployedLowPredictor` — 长轨迹 + 逐无人机在线学习（40 帧输入）
+### 2. `DeployedLowPredictor` — Long Trajectory + Per-Drone Online Learning (40-frame input)
 
-用于持续飞行的低速无人机，随飞随学，为每架无人机建立个性化 LoRA。
+For persistently-flying low-speed drones. Learns as it flies, building a personalized LoRA for each drone.
 
 ```python
 import torch
 from deploy import DeployedLowPredictor
 
-deployer = DeployedLowPredictor(use_global=True)  # 全局 LoRA 默认开启
+deployer = DeployedLowPredictor(use_global=True)  # global LoRA enabled by default
 
-hist = torch.randn(1, 40, 6)          # 40 帧历史
+hist = torch.randn(1, 40, 6)          # 40 history frames
 result = deployer.predict(
     hist,
-    drone_id='drone_007',             # 设置后启用逐无人机在线 LoRA
-    ground_truth=future_disp,         # (1,20,3) 上一步真值，喂给在线学习（可选）
-    frames_seen=120,                  # 该无人机累计帧数（长度门控用）
+    drone_id='drone_007',             # set this to enable per-drone online LoRA
+    ground_truth=future_disp,         # (1, 20, 3) previous-step ground truth, fed to online learning (optional)
+    frames_seen=120,                  # cumulative frames streamed by this drone (for length gate)
 )
-result['predictions']  # (1, 20, 3) 未来位移
+result['predictions']  # (1, 20, 3) future displacement
 ```
 
-三道门控（详见 `deploy.py` docstring）：
+Three gates (see `deploy.py` docstring for details):
 
-1. **长度门控** (`online_min_frames=60`)：短飞行只用干净 40 帧 base，不加 LoRA。
-2. **全局开关** (`use_global`)：一键开/关共享的低速全局 LoRA (`dir_lora_40`)。
-3. **速度门控** (`global_max_speed=4.0`)：速度超过 4 m/s 时关闭全局 LoRA（它训练于 0–3 m/s 真实飞行，超域不适用）。
+1. **Length gate** (`online_min_frames=60`): short flights use the clean 40-frame base only, no LoRA.
+2. **Global toggle** (`use_global`): master on/off switch for the shared low-speed global LoRA (`dir_lora_40`).
+3. **Speed gate** (`global_max_speed=4.0`): disables global LoRA above 4 m/s (it was trained on 0–3 m/s real flights; out-of-domain use is unsafe).
 
-## 架构
+## Architecture
 
 ```
-Input (B,T,6) → EMam-SE (SSM编码器) → IA-DTP (意图分类) → UA-PGD (解码器)
+Input (B,T,6) → EMam-SE (SSM encoder) → IA-DTP (intent classifier) → UA-PGD (decoder)
                                                              ├─ Physics Inertia Gate
-                                                             ├─ Neural Decoder (1 或 K 个头)
+                                                             ├─ Neural Decoder (1 or K heads)
                                                              └─ Kinematic Physics Model
 ```
 
-### 双模型软融合
+### Dual-Model Soft Fusion
 
-| 模型 | 数据集 | 类别 | 频率 | 速度域 | 历史长度 |
+| Model | Dataset | Classes | Frequency | Speed Domain | History Length |
 |:--|:--|:--|:--|:--|:--|
-| LOW | UAV-Flow (真实DJI) | 6-class | 5Hz | 0–3 m/s | 40 帧 (长) / 20 帧 (短) |
-| HIGH | SimCruise (仿真巡航) | 4-class | 1Hz | 8–28 m/s | 20 帧 |
+| LOW | UAV-Flow (real DJI) | 6-class | 5 Hz | 0–3 m/s | 40 frames (long) / 20 frames (short) |
+| HIGH | SimCruise (simulated cruise) | 4-class | 1 Hz | 8–28 m/s | 20 frames |
 
-- 软融合：`α = sigmoid((speed - 5.0) / 1.2)`，过渡区 [2, 8] m/s 平滑混合，区外硬分配避免跨域污染。
-- **HIGH 保持 20 帧**：40 帧扩展在 1Hz 巡航上是负收益（20 帧已 = 20s），已验证否决。
+- Soft fusion: `α = sigmoid((speed - 5.0) / 1.2)`, smooth blending in the [2, 8] m/s transition zone; hard assignment outside to avoid cross-domain contamination.
+- **HIGH stays at 20 frames**: 40-frame expansion on 1 Hz cruise data is a net negative (20 frames = 20 s already); verified and rejected.
 
-### 40 帧扩展（LOW）
+### 40-Frame Expansion (LOW)
 
-- `low_speed_6class_40frame.pth`：从 20 帧 checkpoint 迁移 147/148 权重，冻结编码器、微调解码器+门控。
-- 长轨迹覆盖率 7% → 84%，FDE 0.87m（vs 20 帧 2.32m），灾难性失败近零。
-- 自适应步长采样：`stride = max(1, min(4, n//60))`。
+- `low_speed_6class_40frame.pth`: migrated 147/148 weights from the 20-frame checkpoint, froze the encoder, fine-tuned the decoder + gate.
+- Long-trajectory coverage: 7% → 84%, FDE: 0.87 m (vs. 2.32 m at 20 frames), catastrophic failures near zero.
+- Adaptive-stride sampling: `stride = max(1, min(4, n // 60))`.
 
-### LoRA 策略
+### LoRA Strategy
 
-LoRA = **锦上添花**，不是雪中送炭。base 模型先把所有长度处理好，LoRA 再做增量个性化。
+LoRA = **icing on the cake**, not the cake itself. The base model first handles all trajectory lengths; LoRA then provides incremental personalization.
 
-- **上游 targets（不含 delta_head）**：SSM in/out_proj + `ua_pgd.feat_compress` + `neural_decoder.proj.0`，头部只微调 `anchor_to_pos.2`，约 100K 参数。
-- **为何排除 delta_head**：它逐步独立处理 20 个预测步，LoRA 作用其上会放大步间差异 → 锯齿轨迹。
-- **全局 LoRA**：`dir_lora_40.pth`（当前最佳，方向加权训练）。
-  - window-level 划分：FDE +19.4%，方向误差 13.8°→12.1°（同飞行窗口可能同现于训练/测试，偏乐观）。
-  - **跨飞行划分（诚实泛化，20% 飞行完全留出）：FDE +7.3%，方向 +4.6%**（`eval/eval_global_lora_generalization.py`）。真实部署应以此为准。
-- **叠加**：40 帧 base → 合并全局 LoRA → 逐无人机在线 LoRA。
+- **Upstream targets (excluding delta_head)**: SSM in/out_proj + `ua_pgd.feat_compress` + `neural_decoder.proj.0`. Head-only target: `anchor_to_pos.2`. ~100K parameters.
+- **Why delta_head is excluded**: it independently processes 20 prediction steps; applying LoRA on it amplifies step-to-step variance → zigzag trajectories.
+- **Global LoRA**: `dir_lora_40.pth` (current best, trained with direction-weighted loss).
+  - Window-level split: FDE +19.4%, direction error 13.8° → 12.1° (same-flight windows may appear in both train/test — optimistic).
+  - **Cross-flight split (honest generalization, 20% flights held out): FDE +7.3%, direction +4.6%** (`eval/eval_global_lora_generalization.py`). Use this number for real deployment.
+- **Stacking**: 40-frame base → merged global LoRA → per-drone online LoRA.
 
-### 在线持续学习
+### Online Continual Learning
 
-逐无人机流式增量适配：replay buffer + CUSUM 漂移检测 + 常驻 adapter，gentle 配置（lr 3e-5, accum 10, l2 0.05）。
+Per-drone streaming incremental adaptation: replay buffer + CUSUM drift detection + resident adapter, gentle config (lr 3e-5, accum 10, l2 0.05).
 
-- **因果验证结论**：真实部署只能见因果 warmup 数据时，流式在线（+2.4%）远胜离线批量微调（-202% 灾难性过拟合）。
-- LOW：FDE +1.6%，21/30 无人机改善（5Hz 每段飞行数据有限，增益温和）。
-- HIGH：FDE +5.1%，25/25 无人机改善（巡航系统性偏差更多，无全局层→个性化空间更大）。
+- **Causal verification finding**: under realistic deployment constraints (only causal warmup data available), streaming online (+2.4%) vastly outperforms offline batch fine-tuning (−202% catastrophic overfit).
+- LOW: FDE +1.6%, 21/30 drones improve (5 Hz, limited data per flight segment → modest gain).
+- HIGH: FDE +5.1%, 25/25 drones improve (cruise data has more systematic bias, no global layer → larger personalization headroom).
 
-### 多假设预测 (Multi-Hypothesis)
+### Multi-Hypothesis Prediction
 
-K=5 独立预测头 + 置信度评分头，Winner-Takes-All 训练。推理取置信度最高，或用 minFDE_K 评估。
+K=5 independent prediction heads + confidence scoring head, Winner-Takes-All training. At inference, pick the highest-confidence head, or evaluate with minFDE_K.
 
-## 目录结构
+## Directory Structure
 
-根目录只放**运行时库**（被到处 import 的核心模块）+ 两个推理入口；脚本按用途分入 `eval/` `train/` `viz/` `tests/`。
+The root directory contains only **runtime libraries** (core modules imported everywhere) + the two inference entry points. Scripts are organized by purpose into `eval/` `train/` `viz/` `tests/`.
 
 ```
-├── predictor.py              # DronePredictor — 通用推理入口 (软融合 + Z 纠正)
-├── deploy.py                 # DeployedLowPredictor — 长轨迹 + 在线学习入口 (三门控)
-├── online_config.py          # 在线学习权威配置 (LoRA targets / 权重文件 / 门控阈值)
-├── online_learner.py         # OnlineLearner — 流式增量训练
-├── adapter_manager.py        # DroneAdapterManager — 逐无人机 adapter 存取
-├── streaming.py              # 流式数据缓冲 + 漂移检测
-├── lora.py                   # LoRALinear / LoRAAdapter — 低秩适配核心
-├── dynamic_norm.py           # 动态归一化
-├── fix_labels.py             # UAV-Flow 标签修正
-├── emam_model/               # EMAM 模型架构
+├── predictor.py              # DronePredictor — general inference entry (soft fusion + Z correction)
+├── deploy.py                 # DeployedLowPredictor — long trajectory + online learning entry (3 gates)
+├── online_config.py          # Authoritative online-learning config (LoRA targets / weight files / gate thresholds)
+├── online_learner.py         # OnlineLearner — streaming incremental training
+├── adapter_manager.py        # DroneAdapterManager — per-drone adapter persistence
+├── streaming.py              # Streaming data buffer + drift detection
+├── lora.py                   # LoRALinear / LoRAAdapter — low-rank adaptation core
+├── dynamic_norm.py           # Dynamic normalization
+├── fix_labels.py             # UAV-Flow label correction
+├── emam_model/               # EMAM model architecture
 │   ├── model.py              # TrajectoryPredictor
-│   ├── emam_se.py            # Enhanced Mamba + SE (含可选 chunked SSM scan)
+│   ├── emam_se.py            # Enhanced Mamba + SE (with optional chunked SSM scan)
 │   ├── ia_dtp.py             # Intent-Aware DTP
-│   ├── ua_pgd.py             # UA-PGD + 多假设解码器 + 运动学物理模型
-│   ├── trigger.py            # 事件触发器
-│   └── bidirectional_mamba.py # 双向增强器 (独立实验, 主流程未启用)
-├── utils/                    # 数据加载 & 评估指标 & 日志
-├── eval/                     # 评估脚本 (evaluate / eval_lora / eval_online_* ...)
-├── train/                    # 训练流水线 + LoRA/多假设训练 + 40 帧扩展
-├── viz/                      # 可视化 + 诊断 + rollout
-├── tests/                    # 回归测试 (deploy 门控 / SSM scan) + 延迟基准
-├── weights/                  # 预训练权重 (见下表)
-├── pic-results/              # 评估图表 + README.md
-└── reviewtodelete/           # 弃置文件暂存 (gitignore, 待人工删除)
+│   ├── ua_pgd.py             # UA-PGD + multi-hypothesis decoder + kinematic physics model
+│   ├── trigger.py            # Event trigger
+│   └── bidirectional_mamba.py # Bidirectional enhancer (standalone experiment, not used in main pipeline)
+├── utils/                    # Data loaders & evaluation metrics & logging
+├── eval/                     # Evaluation scripts (evaluate / eval_lora / eval_online_* …)
+├── train/                    # Training pipelines + LoRA/multi-hypothesis training + 40-frame expansion
+├── viz/                      # Visualization + diagnostics + rollout
+├── tests/                    # Regression tests (deploy gates / SSM scan) + latency benchmark
+├── weights/                  # Pretrained weights (see table below)
+├── pic-results/              # Evaluation plots + README.md
+└── reviewtodelete/           # Deprecated file staging area (gitignored, pending manual deletion)
 ```
 
-> 从根目录运行，例如 `python eval/evaluate.py`、`python tests/test_deploy_gates.py`。
+> Run from the project root, e.g. `python eval/evaluate.py`, `python tests/test_deploy_gates.py`.
 
-**文档：** `README.md`（本文，架构与结果）、`INTERFACE.md`（系统集成接口规范 / ICD）、`ROADMAP.md`（多无人机交互预测下一步规划）。
+**Docs:** `README.md` (this file — English), `README_CN.md` (Chinese), `INTERFACE.md` (system integration ICD), `ROADMAP.md` (multi-drone interaction & future directions).
 
-## 权重文件 (`weights/`)
+## Weight Files (`weights/`)
 
-| 文件 | 说明 |
+| File | Description |
 |:--|:--|
-| `low_speed_6class.pth` | LOW 20 帧原始模型（短/中程） |
-| `low_speed_6class_40frame.pth` | LOW 40 帧扩展（长轨迹默认 base） |
-| `high_speed_4class.pth` | HIGH 20 帧模型 |
-| `dir_lora_40.pth` | **当前最佳全局 LoRA**（方向加权，跨飞行 +7.3% / window-level +19.4% FDE） |
-| `global_lora_40.pth` | 早期全局 LoRA（+14.9%，已被 dir_lora_40 取代） |
-| `gate_lora_40.pth` | 门控 LoRA（改善极端转弯灾难率 -1.76pp） |
-| `low_multihead_K5_40frame.pth` | LOW K=5 多假设头 |
-| `high_multihead_K5.pth` | HIGH K=5 多假设头 |
+| `low_speed_6class.pth` | LOW 20-frame original model (short/mid-range) |
+| `low_speed_6class_40frame.pth` | LOW 40-frame expansion (default base for long trajectories) |
+| `high_speed_4class.pth` | HIGH 20-frame model |
+| `dir_lora_40.pth` | **Current best global LoRA** (direction-weighted, cross-flight +7.3% / window-level +19.4% FDE) |
+| `global_lora_40.pth` | Early global LoRA (+14.9%, superseded by dir_lora_40) |
+| `gate_lora_40.pth` | Gate LoRA (reduces extreme-turn catastrophe rate −1.76 pp) |
+| `low_multihead_K5_40frame.pth` | LOW K=5 multi-hypothesis heads |
+| `high_multihead_K5.pth` | HIGH K=5 multi-hypothesis heads |
 
-## 脚本速查
+## Script Reference
 
-| 脚本 | 用途 |
+| Script | Purpose |
 |:--|:--|
-| `predictor.py` | 通用推理入口（根目录） |
-| `deploy.py` | 长轨迹 + 在线学习部署入口（根目录，含冒烟自测） |
-| `eval/evaluate.py` | ADE/FDE/意图/不确定性综合评估 |
-| `eval/eval_multihead.py` | 多假设完整测试集评估 |
-| `eval/eval_lora.py` / `eval/eval_lora_stack.py` | LoRA / 全局+局部叠加评估 |
-| `eval/eval_online_learning.py` / `eval/eval_online_learning_high.py` | LOW / HIGH 在线学习验证 |
-| `eval/eval_online_vs_offline.py` | 因果条件下 在线 vs 离线批量 对比 |
-| `train/expand_model_low.py` / `train/expand_model_high.py` | 20→40 帧扩展实验（LOW 正 / HIGH 负） |
-| `train/train_lora_direction.py` / `train/train_lora_gate.py` / `train/train_lora_global.py` | 各类全局 LoRA 训练 |
-| `train/train_multihead_low.py` / `train/train_multihead.py` | 多假设解码器训练 (WTA) |
-| `viz/visualize_low.py` / `viz/visualize_multihead.py` / `viz/visualize_trajectories.py` / `viz/visualize_summary.py` | 图表生成 |
-| `viz/diagnose_failures.py` | 最差样本深度诊断 |
-| `viz/rollout.py` | 自回归预测外推 |
-| `fix_labels.py` | UAV-Flow 标签修正（根目录） |
-| `eval/eval_global_lora_generalization.py` | 全局 LoRA 跨飞行泛化验证（飞行级不相交划分） |
-| `tests/test_deploy_gates.py` | 部署三门控 + 在线学习常驻 adapter 回归测试 |
-| `tests/test_ssm_scan.py` | chunked SSM scan 数值等价性测试 |
-| `tests/benchmark_latency.py` | 推理延迟基准（两个入口 + 在线更新） |
+| `predictor.py` | General inference entry (root) |
+| `deploy.py` | Long-trajectory + online learning deployment entry (root, includes smoke self-test) |
+| `eval/evaluate.py` | Comprehensive ADE/FDE/intent/uncertainty evaluation |
+| `eval/eval_multihead.py` | Full test-set multi-hypothesis evaluation |
+| `eval/eval_lora.py` / `eval/eval_lora_stack.py` | LoRA / global+local stacking evaluation |
+| `eval/eval_online_learning.py` / `eval/eval_online_learning_high.py` | LOW / HIGH online learning validation |
+| `eval/eval_online_vs_offline.py` | Online vs. offline batch comparison under causal constraints |
+| `train/expand_model_low.py` / `train/expand_model_high.py` | 20→40 frame expansion experiments (LOW positive / HIGH negative) |
+| `train/train_lora_direction.py` / `train/train_lora_gate.py` / `train/train_lora_global.py` | Global LoRA training variants |
+| `train/train_multihead_low.py` / `train/train_multihead.py` | Multi-hypothesis decoder training (WTA) |
+| `viz/visualize_low.py` / `viz/visualize_multihead.py` / `viz/visualize_trajectories.py` / `viz/visualize_summary.py` | Plot generation |
+| `viz/diagnose_failures.py` | Deep-dive diagnostics on worst-case samples |
+| `viz/rollout.py` | Autoregressive prediction extrapolation |
+| `fix_labels.py` | UAV-Flow label correction (root) |
+| `eval/eval_global_lora_generalization.py` | Global LoRA cross-flight generalization validation (flight-level disjoint split) |
+| `tests/test_deploy_gates.py` | Regression tests for the three deployment gates + online learner resident adapter |
+| `tests/test_ssm_scan.py` | Chunked SSM scan numerical equivalence test (standalone + pytest) |
+| `tests/benchmark_latency.py` | Inference latency benchmark (both entry points + online update) |
 
-> 所有脚本都从**项目根目录**运行（如 `python eval/evaluate.py`），脚本内部会自动定位根目录以加载 `weights/` 与数据集。
+> All scripts are run from the **project root** (e.g. `python eval/evaluate.py`). Scripts auto-locate the root directory to load `weights/` and datasets.
 
-## 性能指标
+## Performance
 
-### LOW — 完整改进链（长轨迹）
+### LOW — Full Improvement Chain (Long Trajectories)
 
-| 阶段 | 长轨迹 FDE | 方向误差 | 灾难率 | 覆盖率 |
+| Stage | Long-Traj FDE | Direction Error | Catastrophe Rate | Coverage |
 |:--|:--:|:--:|:--:|:--:|
-| 原始 20 帧 | 2.32m | 54° | 20.0% | 7% |
-| 40 帧扩展 | 0.87m | ~15° | ~0% | 84% |
-| 40 帧 + LoRA | 0.23m | ~5° | 0% | 84% |
+| Original 20-frame | 2.32 m | 54° | 20.0% | 7% |
+| 40-frame expansion | 0.87 m | ~15° | ~0% | 84% |
+| 40-frame + LoRA | 0.23 m | ~5° | 0% | 84% |
 
-### 多假设 (K=5, minFDE_5 vs 单模型)
+### Multi-Hypothesis (K=5, minFDE_5 vs. single model)
 
 | | LOW | HIGH |
 |:--|:--:|:--:|
-| minFDE_5 | 0.60m (+31.6%) | 1.84m (+66%) |
-| minADE_5 | 0.41m (+18.2%) | 0.93m (+46%) |
-| FDE P95 | 1.57m | 5.22m |
+| minFDE_5 | 0.60 m (+31.6%) | 1.84 m (+66%) |
+| minADE_5 | 0.41 m (+18.2%) | 0.93 m (+46%) |
+| FDE P95 | 1.57 m | 5.22 m |
 
-### 在线学习（因果验证）
+### Online Learning (Causal Verification)
 
-| | 冻结 | 在线流式 | 改善 |
+| | Frozen | Streaming Online | Improvement |
 |:--|:--:|:--:|:--:|
-| LOW FDE | 0.648m | 0.638m | +1.6% (21/30 drones) |
-| HIGH FDE | 4.28m | 4.06m | +5.1% (25/25 drones) |
+| LOW FDE | 0.648 m | 0.638 m | +1.6% (21/30 drones) |
+| HIGH FDE | 4.28 m | 4.06 m | +5.1% (25/25 drones) |
 
-### 全局 LoRA 泛化性（诚实评估）
+### Global LoRA Generalization (Honest Evaluation)
 
-| 划分方式 | FDE 增益 | 方向增益 | 说明 |
+| Split Method | FDE Gain | Direction Gain | Notes |
 |:--|:--:|:--:|:--|
-| window-level（旧） | +19.4% | +12.3% | 同飞行窗口可能同现于训练/测试，偏乐观 |
-| **跨飞行（20% 飞行留出）** | **+7.3%** | **+4.6%** | held-out 飞行从未见过，**部署以此为准** |
+| Window-level (old) | +19.4% | +12.3% | Same-flight windows may appear in both train/test — optimistic |
+| **Cross-flight (20% flights held out)** | **+7.3%** | **+4.6%** | Held-out flights never seen during training — **use this for deployment** |
 
-### 推理延迟（RTX 3060 Laptop, batch=1, 单无人机流）
+### Inference Latency (RTX 3060 Laptop, batch=1, single-drone stream)
 
-| 调用路径 | mean | p50 | p95 | 吞吐 |
+| Call Path | Mean | P50 | P95 | Throughput |
 |:--|:--:|:--:|:--:|:--:|
 | `DronePredictor.predict` (20f) | 35.3 ms | 34.2 ms | 44.2 ms | 28 fps |
-| `DeployedLowPredictor.predict` (40f, 仅推理) | 20.1 ms | 18.9 ms | 27.3 ms | 50 fps |
-| `DeployedLowPredictor.predict` (40f, 含在线更新) | 30.3 ms | 19.9 ms | 117.9 ms | 33 fps |
+| `DeployedLowPredictor.predict` (40f, inference only) | 20.1 ms | 18.9 ms | 27.3 ms | 50 fps |
+| `DeployedLowPredictor.predict` (40f, with online update) | 30.3 ms | 19.9 ms | 117.9 ms | 33 fps |
 
-> 实时裕量：LOW 5Hz（200ms/帧）有 ~10× 裕量，HIGH 1Hz（1000ms/帧）有 ~50× 裕量。在线更新的 p95 尖峰来自每 10 帧触发一次的 LoRA 更新，仍远低于帧预算。
+> Real-time headroom: LOW at 5 Hz (200 ms/frame) has ~10× headroom; HIGH at 1 Hz (1000 ms/frame) has ~50× headroom. The online path's P95 spike comes from the LoRA update firing every 10 frames — still well under the frame budget.
 
-## 模型规格
+## Model Specs
 
-- 参数量：~1.4M / 模型 (d_model=128, d_state=16)
-- 逐无人机在线 LoRA：~100K 参数
-- 多假设头：+48K 参数 (K=5)
-- 输入：20 或 40 帧 × 6 维 [pos, vel]；输出：20 帧 × 3 维位移
-- 硬件：RTX 3060 Laptop (6GB), Windows 11, Python 3.10, CUDA 11.8
+- Parameters: ~1.4M / model (d_model=128, d_state=16)
+- Per-drone online LoRA: ~100K parameters
+- Multi-hypothesis heads: +48K parameters (K=5)
+- Input: 20 or 40 frames × 6 dimensions [pos, vel]; output: 20 frames × 3 dimensions displacement
+- Hardware: RTX 3060 Laptop (6 GB), Windows 11, Python 3.10, CUDA 11.8
 
-## 已知问题与后续方向
+## Known Issues & Future Directions
 
-- **LOW 方向误差**仍高于 HIGH，多假设 + dir_lora 已改善，仍有空间。
-- **极端转弯 (>150°)**：需架构级改动，gate_lora 只能缓解。
-- **物理模型 2 帧速度种子**：曾试多帧最小二乘种子，验证为负收益（已否决，勿重试）。
-- **全局 LoRA 泛化性**：已用跨飞行划分诚实验证，held-out 飞行 FDE +7.3%（window-level +19.4% 偏乐观）；架构支持一键关闭以应对 OOD。
-- 测试覆盖：门控/在线学习/SSM 有回归测试 + 延迟基准，predictor 软融合与 40 帧扩展尚无专门回归测试。
+- **LOW direction error** remains higher than HIGH; multi-hypothesis + dir_lora have improved it, but headroom remains.
+- **Extreme turns (>150°)**: require architecture-level changes; gate_lora only mitigates.
+- **Physics model 2-frame velocity seed**: a multi-frame least-squares seed was tested and verified negative (rejected; do not retry).
+- **Global LoRA generalization**: honestly validated with a cross-flight split; held-out flight FDE +7.3% (the window-level +19.4% is optimistic). Architecture supports disabling global LoRA with a single flag for OOD scenarios.
+- Test coverage: gates / online learning / SSM have regression tests + latency benchmark. The predictor soft-fusion and 40-frame expansion do not yet have dedicated regression tests.
 
-## 许可
+## License
 
-仅限研究用途。
+Research use only.
