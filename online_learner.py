@@ -22,16 +22,28 @@ class OnlineLearnerConfig:
     """Hyperparameters for online continual learning."""
 
     # Optimizer
-    lr: float = 1e-4
+    # NOTE (2026-07-24): lr lowered 1e-4 -> 3e-5 and accumulation 5 -> 10 after
+    # the online-learning study: the aggressive default overfit the warmup segment
+    # and HURT held-out FDE (-8%); the gentler setting turns it net-positive and
+    # helps more drones. See eval_online_learning.py.
+    lr: float = 3e-5
     weight_decay: float = 1e-5
     max_grad_norm: float = 1.0
 
     # Accumulation
-    accumulation_steps: int = 5
+    accumulation_steps: int = 10
     replay_ratio: float = 0.4
 
     # Regularization
-    lora_l2_penalty: float = 0.01
+    lora_l2_penalty: float = 0.05
+
+    # Loss (aligned with the offline 40-frame LoRA: normalized Huber + direction
+    # + boundary continuity, instead of raw meter-scale MSE).
+    scale_pos: float = 100.0
+    dt: float = 0.2
+    beta_huber: float = 0.20
+    w_dir: float = 0.30
+    w_boundary: float = 0.40
 
     # Confidence gating
     conf_threshold: float = 0.75
@@ -115,10 +127,13 @@ class OnlineLearner:
         current_samples = buffer[:k_current]
         replay_samples = replay.sample(m_replay) if m_replay > 0 else []
 
-        # Activate adapter and rebind optimizer params
+        # Ensure this drone's adapter is the active (resident) one. We keep it
+        # active across updates — deactivating recreates a fresh zero-init LoRA
+        # and would discard everything learned so far.
         was_active = (self.mgr.active_drone == drone_id)
         if not was_active:
             self.mgr.activate(drone_id)
+            # Rebind optimizer to the (possibly new) live LoRA params.
             if drone_id in self._optimizers:
                 trainable = self.mgr.adapter.get_trainable_params()
                 self._optimizers[drone_id].param_groups[0]['params'] = trainable
@@ -136,14 +151,28 @@ class OnlineLearner:
         out = self.mgr.adapter.model(histories, force_predict=True)
         predictions = out['predictions']
 
-        # MSE loss + L2 penalty on LoRA params
-        mse_loss = F.mse_loss(predictions, futures)
+        # Supervision loss aligned with the offline 40-frame LoRA:
+        # normalized Huber + direction cosine + step-0 boundary continuity.
+        # (Raw meter-scale MSE was scale-mismatched vs the L2 regularizer.)
+        sp = cfg.scale_pos
+        pred_n = predictions / sp
+        tgt_n = futures / sp
+        loss_huber = F.smooth_l1_loss(pred_n, tgt_n, beta=cfg.beta_huber)
+        pv = pred_n[:, 1:, :] - pred_n[:, :-1, :]
+        tv = tgt_n[:, 1:, :] - tgt_n[:, :-1, :]
+        loss_dir = (1.0 - F.cosine_similarity(pv, tv, dim=-1)).mean()
+        # boundary: first predicted step should continue the last observed velocity.
+        # ec = last_vel[m/s] * dt, in meters, then normalized by scale_pos.
+        pc = pred_n[:, 0, :]
+        ec = (histories[:, -1, 3:6] * cfg.dt) / sp
+        loss_boundary = ((pc - ec) ** 2).mean()
 
         l2_penalty = torch.tensor(0.0, device=model_device)
         for layer in self.mgr.adapter.lora_layers.values():
             l2_penalty += layer.lora_A.norm() ** 2 + layer.lora_B.norm() ** 2
 
-        loss = mse_loss + cfg.lora_l2_penalty * l2_penalty
+        loss = (loss_huber + cfg.w_dir * loss_dir + cfg.w_boundary * loss_boundary
+                + cfg.lora_l2_penalty * l2_penalty)
 
         # NaN protection
         if torch.isnan(loss) or torch.isinf(loss):
@@ -201,8 +230,10 @@ class OnlineLearner:
         if self._update_counters[drone_id] % cfg.save_every == 0:
             self.mgr.save(drone_id, replay_buffer=replay, cusum=cusum)
 
-        if not was_active:
-            self.mgr.deactivate()
+        # NOTE: intentionally do NOT deactivate here. The adapter stays resident
+        # so the learned LoRA persists in memory across updates. Callers that need
+        # to switch drones should call mgr.activate(other) (which deactivates this
+        # one) — and for multi-drone use, save() before switching to avoid loss.
 
         return loss_val
 
@@ -317,7 +348,7 @@ if __name__ == '__main__':
     print('=== Online Learner Smoke Test ===')
 
     model = TrajectoryPredictor(
-        input_dim=6, history_len=20, pred_len=20,
+        input_dim=6, history_len=40, pred_len=20,
         d_model=128, d_state=16, d_conv=4, expand=2,
         emam_n_layers=2, num_intent_classes=6,
         use_trigger=True, trigger_mode='simple',
@@ -332,7 +363,7 @@ if __name__ == '__main__':
 
     print(f'\nSimulating online learning for {drone}...')
     for i in range(30):
-        hist = torch.randn(20, 6)
+        hist = torch.randn(40, 6)
         future_gt = torch.randn(20, 3) * 0.1
         updated = learner.observe(drone, hist, future_gt, confidence=0.9)
 

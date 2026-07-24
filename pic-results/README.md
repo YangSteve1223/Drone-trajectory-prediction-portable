@@ -4,50 +4,26 @@
 
 ---
 
-## 一、LOW 多假设轨迹可视化 (visualize_low_multihyp.py) ★ 最新
+## 一、LOW 多假设轨迹可视化 — 40帧模型 (visualize_low_40frame.py) ★ 最新
 
-> 从测试集 200+ 样本中多维度评分，精选 24 组。死头自动过滤。epoch 7 权重。
+> 基于 **40帧模型** (`low_speed_6class_40frame.pth` + `low_multihead_K5_40frame.pth`)，
+> 从长轨迹 (≥150帧) 自适应窗口中精选。死头自动过滤。取代旧的 20帧 `low_24_*` 系列。
 
-### low_24_best_3d_p1/2/3.png
-**LOW 模型 — 最高置信度轨迹 3D（24 样本，3 页 × 8 子图）**
+### low40_multihyp_3d.png
+**LOW 40帧 — 多假设 K=5 预测 3D 网格**
+- 深灰线 = 历史 (40帧自适应步长)，绿线 = 真值，K 条彩色 = 假设头，最粗 = 最佳
+- Z 轴已按 XY 比例缩放
 
-- 深灰线 = 历史 4s（20帧@5Hz），绿线 = 地面真值，亮绿虚线 = 最佳预测
-- 绿色圆点/亮绿方块 = 每秒(1s/2s/3s/4s)时间标记
-- 标题标注意图、速度、minFDE、**每秒独立 L2 误差 + Z 误差**
-- Z 轴已按 XY 范围等比缩放，视觉上不会夸大微小 Z 抖动
+### low40_multihyp_xy.png
+**LOW 40帧 — 多假设 XY 俯视网格**
 
-### low_24_best_xy_p1/2/3.png
-**LOW 模型 — 最高置信度轨迹 XY 俯视图（24 样本，3 页 × 8 子图）**
+### low40_per_second_error.png
+**LOW 40帧 — 每秒误差曲线：单假设 vs minFDE_5 (oracle)**
 
-- 同上数据，正上方俯视
-- 自动方形视野 + 15% padding
-- 标题标注每秒误差 + Z 误差
+### low40_error_table.png
+**LOW 40帧 — 逐样本 single/minADE/minFDE + 每秒误差表**
 
-### low_06_multihyp_3d.png
-**LOW 模型 — 多假设 K=4 预测 3D（前 6 名，2×3 大图）**
-
-- 4 种颜色 = 4 个有效假设头，线越粗 = 置信度越高
-- 深灰=历史 绿=真值 亮绿方块=最佳预测时间标记
-
-### low_04_multihyp_xy.png
-**LOW 模型 — 多假设 K=4 XY 网格（前 4 名，2×2）**
-
-- 全部 4 条假设同时展示，置信度标注
-
-### low_24_per_second_error.png
-**LOW 模型 — 24 样本每秒独立误差柱状图**
-
-- 横轴 = 预测时间段 (0-1s / 1-2s / 2-3s / 3-4s)
-- 24 个样本分组柱，每段独立计算 L2 误差
-
-### low_24_error_table.png ★ 误差数据表
-**LOW 模型 — 24 样本每秒误差数值表**
-
-- 每行一个样本：意图、速度、minFDE
-- 四段时间的 **L2 误差**（总）和 **Z 轴误差**（单独）
-- 置信度分布（4 个头部的概率值）
-- 底部汇总：minFDE 范围/均值/中位数
-- 按意图着色，方便快速定位
+> 长轨迹上 single-FDE ≈ 0.70m，minFDE_5 ≈ 0.49m。
 
 ---
 
@@ -111,16 +87,34 @@
 
 ---
 
-## 五、其他
+## 五、40帧后续工作汇总 (visualize_session2_summary.py) ★ 新
 
-### 01_error_heatmap.png
-**逐步预测误差热力图**
+### session2_summary.png
+**40帧后续实验 4 合 1 面板**
 
-- 横轴 = 预测时间，纵轴 = 样本（按终点误差排序）
-- 颜色 = L2 误差（米），越红越大
+1. **全局 LoRA on 40帧** — base / +global / +direction 的 FDE 对比
+2. **方向误差** — dir-LoRA 把方向误差从 13.8° 降到 12.1°
+3. **多假设 + LoRA 叠加** — minFDE_5 及 base/+local/+global+local 叠加对比
+4. **Gate-LoRA on 极端转弯** — >60° 子集的 cata% 和方向误差对比
 
-### rollout_low.png / rollout_high.png
-**自回归外推** — LOW 4s→12s, HIGH 20s→40s
+### lora_40frame/ (子目录)
+**per-drone LoRA on 40帧** — overview_3d/xy + detail_p1-6 (eval_lora_40frame.py 现场训练)
+
+---
+
+## 六、40帧 LoRA 结果速查 (session 2)
+
+| 实验 | 指标 | base | 结果 | 改善 |
+|:--|:--|:--:|:--:|:--:|
+| 全局 LoRA (global_lora_40) | FDE (混合留出) | 0.826m | 0.703m | +14.9% |
+| **方向 LoRA (dir_lora_40)** ★ | FDE | 0.826m | **0.665m** | **+19.4%** |
+| 方向 LoRA | 方向误差 | 13.8° | **12.1°** | +12.3% |
+| 多假设 K=5 (40帧) | minFDE_5 vs single | 0.874m | 0.598m | +31.6% |
+| **LoRA 叠加** (全局+单机) | per-drone FDE | 0.322m(单机) | **0.290m** | +10.2% vs 单机, 13/19 胜 |
+| Gate-LoRA 极端转弯 | cata (>60°子集) | 10.65% | **8.89%** | -1.76pp |
+
+> **负结果**：HIGH 20→40 帧扩展无益 (FDE 11.4→17.5m，1Hz 巡航无输入瓶颈)；
+> 物理模型多帧速度种子无益 (UAV-Flow 敏捷机动下最近2帧才是最佳)。
 
 ---
 

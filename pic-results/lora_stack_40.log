@@ -1,0 +1,41 @@
+================================================================================
+C6 ¡ª Global LoRA + per-drone LoRA STACKING (40-frame base)
+================================================================================
+  Testing on 20 held-out long trajectories (>=150 frames)
+
+  [ 1/20] 2025-04-17_10-49-27.npz             base=0.940  +local=0.243  +global+local=0.318
+  [ 2/20] 2025-04-25_15-22-26.npz             base=1.051  +local=0.231  +global+local=0.197
+  [ 3/20] 2025-04-11_14-11-37.npz             base=0.627  +local=0.267  +global+local=0.251
+  [ 4/20] 2025-04-05_10-21-53.npz             base=0.933  +local=0.221  +global+local=0.176
+  [ 6/20] 2025-04-18_17-04-34.npz             base=1.892  +local=0.527  +global+local=0.419
+  [ 7/20] 2025-04-23_09-37-46.npz             base=0.986  +local=0.273  +global+local=0.236
+  [ 8/20] 2025-04-30_16-23-04.npz             base=1.061  +local=0.409  +global+local=0.438
+  [ 9/20] 2025-04-19_17-01-04.npz             base=0.558  +local=0.209  +global+local=0.196
+  [10/20] 2025-04-23_10-02-21.npz             base=1.863  +local=0.484  +global+local=0.495
+  [11/20] 2025-04-15_11-20-52.npz             base=0.476  +local=0.158  +global+local=0.146
+  [12/20] 2025-04-30_10-10-34.npz             base=0.429  +local=0.204  +global+local=0.234
+  [13/20] 2025-04-06_15-48-12.npz             base=1.095  +local=0.380  +global+local=0.306
+  [14/20] 2025-04-10_16-22-22.npz             base=0.768  +local=0.193  +global+local=0.163
+  [15/20] 2025-04-21_14-39-58.npz             base=1.149  +local=0.365  +global+local=0.233
+  [16/20] 2025-04-25_17-16-09.npz             base=0.837  +local=0.515  +global+local=0.413
+  [17/20] 2025-04-15_08-15-06.npz             base=0.605  +local=0.175  +global+local=0.198
+  [18/20] 2025-04-06_15-34-34.npz             base=0.624  +local=0.242  +global+local=0.246
+  [19/20] 2025-04-23_07-57-51.npz             base=0.753  +local=0.296  +global+local=0.262
+  [20/20] 2025-04-13_16-55-23.npz             base=0.849  +local=0.732  +global+local=0.574
+
+================================================================================
+STACKING RESULTS (19 trajectories)
+================================================================================
+  Config                           mean FDE     median FDE  
+  --------------------------------------------------------
+  (a) 40-frame base                0.9209       0.8492      
+  (b) base + per-drone LoRA        0.3224       0.2672      
+  (c) base + global + per-drone    0.2895       0.2464      
+
+  (b) vs base:  +65.0%
+  (c) vs base:  +68.6%
+  (c) vs (b):   +10.2%  <-- does stacking help?
+  (c) beats (b) on 13/19 trajectories
+
+  Results saved: pic-results/lora_stack_40.json
+================================================================================

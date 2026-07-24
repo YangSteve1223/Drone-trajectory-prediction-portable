@@ -62,8 +62,14 @@ class LoRALinear(nn.Module):
         return self.base_layer.bias
 
     def merge(self):
-        """Merge LoRA into base weights: W' = W + B @ A * scaling."""
-        delta = (self.lora_B.data @ self.lora_A.data.T).T * self.scaling
+        """Merge LoRA into base weights so the plain Linear reproduces the adapted output.
+
+        forward does y = x@W.T + (x@A@B)*scaling, with A:(in,r), B:(r,out).
+        nn.Linear stores W:(out,in) and computes x@W.T, so the equivalent weight
+        delta is (A@B).T * scaling  ->  shape (out,in). (The previous
+        (B@A.T).T formulation had mismatched shapes and never ran.)
+        """
+        delta = (self.lora_A.data @ self.lora_B.data).T * self.scaling   # (out, in)
         self.base_layer.weight.data += delta.to(self.base_layer.weight.dtype)
         self.lora_A.data.zero_()
         self.lora_B.data.zero_()
@@ -74,7 +80,17 @@ class LoRALinear(nn.Module):
             self.base_layer.weight.data -= saved_delta.to(self.base_layer.weight.dtype)
 
 
-# Default target layers — Group A (full finetune) and Group B (LoRA)
+# Default target layers (upstream-only fallback for LoRAAdapter when the caller
+# passes no explicit targets — e.g. the smoke test below).
+#
+# The AUTHORITATIVE production config lives in online_config.ONLINE_LORA_TARGETS /
+# ONLINE_HEAD_TARGETS; deploy.py / adapter_manager / online_learner all use that and
+# never fall back to these. These defaults are kept only so `create_lora_model(model)`
+# works standalone, and they intentionally mirror the validated upstream-only setup.
+#
+# NOTE: `ua_pgd.neural_decoder.delta_head` is deliberately EXCLUDED. The delta_head
+# processes each of the 20 prediction steps independently (ua_pgd.py), so adapting it
+# amplifies per-step differences and produces zigzag trajectories. Do not add it back.
 DEFAULT_LORA_TARGETS = [
     'emam_se.mamba_blocks.0.ssm.in_proj',
     'emam_se.mamba_blocks.0.ssm.out_proj',
@@ -83,10 +99,7 @@ DEFAULT_LORA_TARGETS = [
 ]
 
 DEFAULT_HEAD_TARGETS = [
-    'ua_pgd.neural_decoder.delta_head',
-    'ua_pgd.neural_decoder.var_head.3',
     'ua_pgd.anchor_to_pos.2',
-    'ua_pgd.physics_gate.gate_mlp.2',
 ]
 
 
@@ -95,12 +108,19 @@ class LoRAAdapter(nn.Module):
 
     def __init__(self, model: nn.Module, r: int = 4, alpha: float = 4.0,
                  dropout: float = 0.0,
-                 lora_targets: List[str] = None,
+                 lora_targets=None,
                  head_targets: List[str] = None):
         super().__init__()
         self.r = r
         self.alpha = alpha
-        self.lora_targets = lora_targets or DEFAULT_LORA_TARGETS
+        # lora_targets may be:
+        #   - a list of str paths (uniform rank r), or
+        #   - a list of (path, rank) tuples, or
+        #   - a dict {path: rank}   -> per-target ranks.
+        # alpha per target defaults to 2*rank (matches the offline eval scripts).
+        raw = lora_targets if lora_targets is not None else DEFAULT_LORA_TARGETS
+        self._target_ranks = self._normalize_targets(raw, r)
+        self.lora_targets = list(self._target_ranks.keys())
         self.head_targets = head_targets or DEFAULT_HEAD_TARGETS
 
         self.model = model
@@ -109,6 +129,20 @@ class LoRAAdapter(nn.Module):
         self._original_layers: Dict[str, nn.Module] = {}
         self._original_head_states: Dict[str, torch.Tensor] = {}
         self._active = False
+
+    @staticmethod
+    def _normalize_targets(raw, default_r: int) -> Dict[str, int]:
+        """Normalize lora_targets (list[str] | list[(path,rank)] | dict) -> {path: rank}."""
+        out: Dict[str, int] = {}
+        if isinstance(raw, dict):
+            return dict(raw)
+        for item in raw:
+            if isinstance(item, (tuple, list)):
+                path, rank = item[0], int(item[1])
+            else:
+                path, rank = item, default_r
+            out[path] = rank
+        return out
 
     def _resolve_module(self, path: str) -> nn.Module:
         """Resolve dotted path to a submodule, e.g. 'emam_se.mamba_blocks.0.ssm.in_proj'."""
@@ -131,13 +165,16 @@ class LoRAAdapter(nn.Module):
         if self._active:
             return
 
-        # Group B: Inject LoRA into SSM projection layers
+        # Group B: Inject LoRA into SSM projection layers (per-target rank)
         for path in self.lora_targets:
             original = self._resolve_module(path)
             if not isinstance(original, nn.Linear):
                 raise TypeError(f"{path} is not nn.Linear, got {type(original)}")
             self._original_layers[path] = original
-            lora_layer = LoRALinear(original, r=self.r, alpha=self.alpha)
+            rank = self._target_ranks[path]
+            # per-target alpha = 2*rank when ranks are non-uniform, else use self.alpha
+            alpha = self.alpha if len(set(self._target_ranks.values())) == 1 else rank * 2.0
+            lora_layer = LoRALinear(original, r=rank, alpha=alpha)
             self._set_module(path, lora_layer)
             self.lora_layers[path] = lora_layer
 
@@ -298,9 +335,12 @@ if __name__ == '__main__':
     match = torch.allclose(out_base['predictions'], out_lora_zero['predictions'], atol=1e-5)
     print(f'Zero-init B -> output matches base: {match}')
 
-    # Random LoRA should change output
+    # Random LoRA should change output. Both A and B must be non-zero — with the
+    # zero-init B alone the low-rank term (x@A)@B stays zero and the output is
+    # unchanged, so randomizing A only would not exercise this path.
     for layer in adapter.lora_layers.values():
         nn.init.normal_(layer.lora_A, std=0.1)
+        nn.init.normal_(layer.lora_B, std=0.1)
     with torch.no_grad():
         out_lora_rand = model(x, force_predict=True)
     diff = (out_lora_rand['predictions'] - out_base['predictions']).abs().mean().item()
@@ -313,17 +353,31 @@ if __name__ == '__main__':
     restored_match = torch.allclose(out_base['predictions'], out_restored['predictions'], atol=1e-5)
     print(f'Deactivate -> output restored: {restored_match}')
 
-    # State export/import
+    # State export/import. Set a known non-trivial state, snapshot it and its output,
+    # then reset (which zeroes B -> output collapses back to base) and reload. The
+    # reloaded output must match the snapshot, and must differ from the reset state.
     adapter.activate()
+    for layer in adapter.lora_layers.values():
+        nn.init.normal_(layer.lora_A, std=0.1)
+        nn.init.normal_(layer.lora_B, std=0.1)
     lora_state = adapter.get_lora_state()
     head_state = adapter.get_head_state()
+    with torch.no_grad():
+        out_snapshot = model(x, force_predict=True)
+
     adapter.reset()
+    with torch.no_grad():
+        out_after_reset = model(x, force_predict=True)
+    reset_changed = not torch.allclose(out_snapshot['predictions'], out_after_reset['predictions'], atol=1e-5)
+
     adapter.load_lora_state(lora_state)
     adapter.load_head_state(head_state)
     with torch.no_grad():
         out_reloaded = model(x, force_predict=True)
-    reload_match = torch.allclose(out_lora_rand['predictions'], out_reloaded['predictions'], atol=1e-5)
+    reload_match = torch.allclose(out_snapshot['predictions'], out_reloaded['predictions'], atol=1e-5)
+    print(f'Reset actually clears LoRA: {reset_changed}')
     print(f'State save/load -> output preserved: {reload_match}')
 
     adapter.deactivate()
+    assert match and restored_match and reset_changed and reload_match, 'LoRA smoke test FAILED'
     print(f'\nAll tests passed!')

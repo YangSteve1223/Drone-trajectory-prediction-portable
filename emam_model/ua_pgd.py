@@ -186,6 +186,11 @@ class KinematicPhysicsModel(nn.Module):
     Acceleration bound: |a| <= max_acc (typical drone value: 15 m/s^2)
 
     Serves only as a strong inductive bias, blended in when the inertia gate is open; not a hard constraint.
+
+    NOTE (2026-07-24): a multi-frame least-squares velocity seed was tried and
+    REJECTED — it consistently hurt FDE/direction on UAV-Flow (agile low-speed
+    flight, where the most recent 2-frame velocity is the best predictor of the
+    next motion; multi-frame averaging lags on turns). Do not revisit.
     """
     def __init__(self, trajectory_dim: int = 6, max_accel: float = 15.0):
         super().__init__()

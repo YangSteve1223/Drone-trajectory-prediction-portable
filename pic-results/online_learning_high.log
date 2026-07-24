@@ -1,0 +1,42 @@
+================================================================================
+Phase B ¡ª HIGH online per-drone learning (base + per-drone LoRA, NO global)
+================================================================================
+  25 HIGH drones (SimCruise flights >= 120 frames)
+
+  [ 1/25] frozen=6.290 online=6.175 (+1.8%)
+  [ 2/25] frozen=4.015 online=3.637 (+9.4%)
+  [ 3/25] frozen=5.430 online=5.316 (+2.1%)
+  [ 4/25] frozen=2.198 online=1.885 (+14.2%)
+  [ 5/25] frozen=3.236 online=2.926 (+9.6%)
+  [ 6/25] frozen=2.924 online=2.692 (+7.9%)
+  [ 7/25] frozen=8.053 online=7.982 (+0.9%)
+  [ 8/25] frozen=7.805 online=7.437 (+4.7%)
+  [ 9/25] frozen=3.698 online=3.557 (+3.8%)
+  [10/25] frozen=3.103 online=2.900 (+6.5%)
+  [11/25] frozen=3.044 online=2.889 (+5.1%)
+  [12/25] frozen=1.624 online=1.314 (+19.1%)
+  [13/25] frozen=2.547 online=2.381 (+6.5%)
+  [14/25] frozen=2.065 online=1.678 (+18.7%)
+  [15/25] frozen=3.069 online=2.922 (+4.8%)
+  [16/25] frozen=2.811 online=2.698 (+4.0%)
+  [17/25] frozen=7.415 online=7.269 (+2.0%)
+  [18/25] frozen=6.457 online=6.192 (+4.1%)
+  [19/25] frozen=4.636 online=4.466 (+3.7%)
+  [20/25] frozen=4.677 online=4.524 (+3.3%)
+  [21/25] frozen=6.394 online=6.237 (+2.5%)
+  [22/25] frozen=1.810 online=1.478 (+18.4%)
+  [23/25] frozen=2.986 online=2.673 (+10.5%)
+  [24/25] frozen=3.524 online=3.363 (+4.6%)
+  [25/25] frozen=7.076 online=6.841 (+3.3%)
+
+================================================================================
+HIGH ONLINE LEARNING RESULTS (25 drones)
+================================================================================
+                 FROZEN       ONLINE       Change    
+  mean FDE       4.2754       4.0572          +5.1%
+  median FDE     3.5238       3.3628      
+  mean Dir(deg)  0.20         0.15           +26.9%
+  online beats frozen on 25/25 drones
+
+  Saved: pic-results/online_learning_high.json
+================================================================================

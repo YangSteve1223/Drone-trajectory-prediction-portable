@@ -1,0 +1,33 @@
+================================================================================
+B4 ¡ª Gate-LoRA for extreme turns (40-frame base)
+================================================================================
+  24012 windows | extreme-turn(>60deg): 7335
+  Train 20411  Test 3601 (extreme in test: 1080)
+  Train turn-weight mean=1.74 max=4.00
+
+  BASE  all: FDE=1.918 Dir=30.5 Cata=5.80%
+  BASE  extreme(>60): FDE=1.524 Dir=41.0 Cata=10.65% (n=1080)
+  R1 ep 0: loss=0.4775  extreme Cata=9.44% Dir=40.0
+  R1 ep 8: loss=0.4608  extreme Cata=9.26% Dir=39.8
+  R1 ep16: loss=0.4560  extreme Cata=9.17% Dir=39.6
+  R1 ep24: loss=0.4542  extreme Cata=8.89% Dir=39.6
+  R2 ep 0: loss=0.4767  extreme Cata=9.54% Dir=40.1
+  R2 ep 8: loss=0.4599  extreme Cata=9.54% Dir=39.7
+  R2 ep16: loss=0.4560  extreme Cata=9.35% Dir=40.1
+  R2 ep24: loss=0.4544  extreme Cata=8.98% Dir=39.8
+
+================================================================================
+B4 GATE-LoRA RESULTS (params=3,600)
+================================================================================
+  Metric                   Base         +Gate-LoRA   Change    
+  ----------------------------------------------------------
+  All FDE                  1.918        1.690          +11.9%
+  All Dir(deg)             30.5         28.6            +6.1%
+  All Cata%                5.80         4.92        
+  -- extreme turn subset --
+  Extreme FDE              1.524        1.499           +1.6%
+  Extreme Dir(deg)         41.0         39.6            +3.3%
+  Extreme Cata%            10.65        8.89           +1.76pp
+
+  Saved: weights/gate_lora_40.pth, pic-results/gate_lora_40.json
+================================================================================

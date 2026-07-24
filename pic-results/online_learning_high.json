@@ -1,0 +1,136 @@
+{
+  "n_drones": 25,
+  "n_better": 25,
+  "frozen_mean_fde": 4.275414505004883,
+  "online_mean_fde": 4.057222423553466,
+  "fde_gain_pct": 5.103413509871302,
+  "frozen_mean_dir": 0.20166387429147076,
+  "online_mean_dir": 0.1474513624707702,
+  "per_drone": [
+    {
+      "drone": "high_0",
+      "frozen_fde": 6.289938449859619,
+      "online_fde": 6.1745758056640625
+    },
+    {
+      "drone": "high_1",
+      "frozen_fde": 4.015048980712891,
+      "online_fde": 3.6372272968292236
+    },
+    {
+      "drone": "high_2",
+      "frozen_fde": 5.430052280426025,
+      "online_fde": 5.315754413604736
+    },
+    {
+      "drone": "high_3",
+      "frozen_fde": 2.197866916656494,
+      "online_fde": 1.8849676847457886
+    },
+    {
+      "drone": "high_4",
+      "frozen_fde": 3.2360024452209473,
+      "online_fde": 2.9262495040893555
+    },
+    {
+      "drone": "high_5",
+      "frozen_fde": 2.923957586288452,
+      "online_fde": 2.691617250442505
+    },
+    {
+      "drone": "high_6",
+      "frozen_fde": 8.053080558776855,
+      "online_fde": 7.982411861419678
+    },
+    {
+      "drone": "high_7",
+      "frozen_fde": 7.804913520812988,
+      "online_fde": 7.437404155731201
+    },
+    {
+      "drone": "high_8",
+      "frozen_fde": 3.6978349685668945,
+      "online_fde": 3.5567402839660645
+    },
+    {
+      "drone": "high_9",
+      "frozen_fde": 3.102562427520752,
+      "online_fde": 2.8996238708496094
+    },
+    {
+      "drone": "high_10",
+      "frozen_fde": 3.043947458267212,
+      "online_fde": 2.8887593746185303
+    },
+    {
+      "drone": "high_11",
+      "frozen_fde": 1.6242234706878662,
+      "online_fde": 1.313983678817749
+    },
+    {
+      "drone": "high_12",
+      "frozen_fde": 2.5465612411499023,
+      "online_fde": 2.3808064460754395
+    },
+    {
+      "drone": "high_13",
+      "frozen_fde": 2.065014362335205,
+      "online_fde": 1.6779797077178955
+    },
+    {
+      "drone": "high_14",
+      "frozen_fde": 3.068648338317871,
+      "online_fde": 2.922315835952759
+    },
+    {
+      "drone": "high_15",
+      "frozen_fde": 2.8106303215026855,
+      "online_fde": 2.698256731033325
+    },
+    {
+      "drone": "high_16",
+      "frozen_fde": 7.415482997894287,
+      "online_fde": 7.269073486328125
+    },
+    {
+      "drone": "high_17",
+      "frozen_fde": 6.45654296875,
+      "online_fde": 6.1917548179626465
+    },
+    {
+      "drone": "high_18",
+      "frozen_fde": 4.635933876037598,
+      "online_fde": 4.4662299156188965
+    },
+    {
+      "drone": "high_19",
+      "frozen_fde": 4.677164077758789,
+      "online_fde": 4.524067401885986
+    },
+    {
+      "drone": "high_20",
+      "frozen_fde": 6.394162178039551,
+      "online_fde": 6.2365312576293945
+    },
+    {
+      "drone": "high_21",
+      "frozen_fde": 1.8100860118865967,
+      "online_fde": 1.4776614904403687
+    },
+    {
+      "drone": "high_22",
+      "frozen_fde": 2.98616099357605,
+      "online_fde": 2.6727795600891113
+    },
+    {
+      "drone": "high_23",
+      "frozen_fde": 3.5238044261932373,
+      "online_fde": 3.3627939224243164
+    },
+    {
+      "drone": "high_24",
+      "frozen_fde": 7.075741767883301,
+      "online_fde": 6.840994834899902
+    }
+  ]
+}

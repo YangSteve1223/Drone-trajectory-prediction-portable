@@ -1,0 +1,47 @@
+================================================================================
+Direction-focused LoRA Training ¡ª 40-FRAME base (B3)
+  Base: low_speed_6class_40frame.pth (history_len=40)
+  Data: 30000 adaptive-stride windows (short+medium+long)
+  Epochs: 30  Restarts: 2  Batch: 64
+================================================================================
+
+[1/4] Loading 40-frame base model...
+  40-frame base loaded. Params: 1,365,471
+
+[2/4] Collecting 30000 adaptive windows...
+  Short(<80): 16050  Medium: 3158  Long(>=150): 779
+  short: 0 windows
+  medium: 3311 windows
+  long: 8570 windows
+  Total: 11881  Train: 10098  Test: 1783
+  Turn weights: mean=1.83  max=3.00  >1.5: 7260 windows
+
+[3/4] Base model evaluation (40-frame, no LoRA)...
+  40-frame base: ADE=0.431m  FDE=0.826m  Dir=13.8deg  Cata=0.8%  Gap=0.365m
+  Precomputing base anchor predictions for training set...
+
+[4/4] Training Global LoRA on 40-frame base...
+  Restart 1 Epoch  0: loss=0.2782  lr=0.000997
+  Restart 1 Epoch 10: loss=0.2711  lr=0.000706
+  Restart 1 Epoch 20: loss=0.2483  lr=0.000214
+  Restart 1: test FDE = 0.665m (base=0.826m, gain=+19.5%)
+  Restart 2 Epoch  0: loss=0.2790  lr=0.000997
+  Restart 2 Epoch 10: loss=0.2713  lr=0.000706
+  Restart 2 Epoch 20: loss=0.2504  lr=0.000214
+  Restart 2: test FDE = 0.667m (base=0.826m, gain=+19.2%)
+
+================================================================================
+DIRECTION LoRA (40-frame base) RESULTS
+  Trainable params: 102,595 (7.0% of full model)
+================================================================================
+  Metric             40f base       +Dir LoRA        Change    
+  ----------------------------------------------------------
+  ADE                0.431          0.380              +11.7%
+  FDE                0.826          0.665              +19.4%
+  Direction(deg)     13.8           12.1               +12.3%
+  Cata(>90deg)%      0.8            1.3             
+  Boundary Gap       0.365          0.253           
+
+  Saved: E:\Desktop\TASKS AND WORK\Drone-trajectory-prediction\Drone-trajectory-prediction-portable\weights\dir_lora_40.pth
+  Results saved: pic-results/dir_lora_40.json
+================================================================================

@@ -1,0 +1,46 @@
+================================================================================
+Global LoRA Training ¡ª 40-FRAME base
+  Base: low_speed_6class_40frame.pth (history_len=40)
+  Data: 30000 adaptive-stride windows (short+medium+long)
+  Epochs: 30  Restarts: 2  Batch: 64
+================================================================================
+
+[1/4] Loading 40-frame base model...
+  40-frame base loaded. Params: 1,365,471
+
+[2/4] Collecting 30000 adaptive windows...
+  Short(<80): 16050  Medium: 3158  Long(>=150): 779
+  short: 0 windows
+  medium: 3311 windows
+  long: 8570 windows
+  Total: 11881  Train: 10098  Test: 1783
+
+[3/4] Base model evaluation (40-frame, no LoRA)...
+  40-frame base: ADE=0.431m  FDE=0.826m  Dir=13.8deg  Cata=0.8%  Gap=0.365m
+  Precomputing base anchor predictions for training set...
+
+[4/4] Training Global LoRA on 40-frame base...
+  Restart 1 Epoch  0: loss=0.2407  lr=0.000997
+  Restart 1 Epoch 10: loss=0.2678  lr=0.000706
+  Restart 1 Epoch 20: loss=0.2512  lr=0.000214
+  Restart 1: test FDE = 0.700m (base=0.826m, gain=+15.3%)
+  Restart 2 Epoch  0: loss=0.2415  lr=0.000997
+  Restart 2 Epoch 10: loss=0.2681  lr=0.000706
+  Restart 2 Epoch 20: loss=0.2515  lr=0.000214
+  Restart 2: test FDE = 0.713m (base=0.826m, gain=+13.7%)
+
+================================================================================
+GLOBAL LoRA (40-frame base) RESULTS
+  Trainable params: 102,595 (7.0% of full model)
+================================================================================
+  Metric             40f base       +Global LoRA     Change    
+  ----------------------------------------------------------
+  ADE                0.431          0.386              +10.5%
+  FDE                0.826          0.703              +14.9%
+  Direction(deg)     13.8           13.4                +2.9%
+  Cata(>90deg)%      0.8            1.2             
+  Boundary Gap       0.365          0.228           
+
+  Saved: E:\Desktop\TASKS AND WORK\Drone-trajectory-prediction\Drone-trajectory-prediction-portable\weights\global_lora_40.pth
+  Results saved: pic-results/global_lora_40.json
+================================================================================

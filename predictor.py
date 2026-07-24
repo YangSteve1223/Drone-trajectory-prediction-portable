@@ -491,7 +491,15 @@ class DronePredictor:
 
     def enable_adaptation(self, checkpoint_dir: str = 'checkpoints/adapters',
                           lora_r: int = 4, accumulation_steps: int = 5):
-        """Enable per-drone LoRA online adaptation on the low-speed model."""
+        """Enable per-drone LoRA online adaptation on the low-speed model.
+
+        NOTE: this binds adaptation to the 20-frame `self.low` (the deployment
+        inference model with Z-correction/soft-fusion). The validated 40-frame
+        online-learning path is exercised via online_config.build_online_base()
+        + DroneAdapterManager + OnlineLearner directly (see eval_online_learning.py),
+        which uses the correct upstream-only LoRA config. The manager now defaults
+        to that config regardless of base.
+        """
         from adapter_manager import DroneAdapterManager
         from online_learner import OnlineLearner, OnlineLearnerConfig
 

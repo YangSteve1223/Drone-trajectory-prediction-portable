@@ -1,0 +1,18 @@
+{
+  "base_model": "low_speed_6class_40frame.pth",
+  "global_lora": "E:\\Desktop\\TASKS AND WORK\\Drone-trajectory-prediction\\Drone-trajectory-prediction-portable\\weights\\dir_lora_40.pth",
+  "train_windows": 10098,
+  "test_windows": 1783,
+  "trainable_params": 102595,
+  "base_ade": 0.43105077743530273,
+  "lora_ade": 0.3804277181625366,
+  "base_fde": 0.8260245323181152,
+  "lora_fde": 0.6654512882232666,
+  "base_dir": 13.827627835073416,
+  "lora_dir": 12.13273815137391,
+  "base_cata": 0.8412787436904094,
+  "lora_cata": 1.346045989904655,
+  "base_gap": 0.3654807209968567,
+  "lora_gap": 0.2532733082771301,
+  "fde_gain_pct": 19.439282710432785
+}

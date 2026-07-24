@@ -13,7 +13,8 @@ import json
 import time
 import os
 
-from lora import LoRAAdapter, DEFAULT_LORA_TARGETS, DEFAULT_HEAD_TARGETS
+from lora import LoRAAdapter
+from online_config import ONLINE_LORA_TARGETS, ONLINE_HEAD_TARGETS
 
 
 @dataclass
@@ -160,8 +161,11 @@ class DroneAdapterManager:
 
         self.r = r
         self.alpha = alpha
-        self.lora_targets = lora_targets or DEFAULT_LORA_TARGETS
-        self.head_targets = head_targets or DEFAULT_HEAD_TARGETS
+        # Default to the validated upstream-only config (per-target ranks, NO
+        # delta_head -> avoids the known zigzag failure). Old DEFAULT_*_TARGETS
+        # (which included delta_head) are no longer used here.
+        self.lora_targets = lora_targets or ONLINE_LORA_TARGETS
+        self.head_targets = head_targets or ONLINE_HEAD_TARGETS
 
         self._active_drone: Optional[str] = None
         self._adapter: Optional[LoRAAdapter] = None
@@ -323,7 +327,7 @@ if __name__ == '__main__':
     print('=== Adapter Manager Smoke Test ===')
 
     model = TrajectoryPredictor(
-        input_dim=6, history_len=20, pred_len=20,
+        input_dim=6, history_len=40, pred_len=20,
         d_model=128, d_state=16, d_conv=4, expand=2,
         emam_n_layers=2, num_intent_classes=6,
         use_trigger=True, trigger_mode='simple',

@@ -1,0 +1,36 @@
+================================================================================
+Multi-Hypothesis (K=5, WTA) on 40-FRAME LOW model
+  Epochs: 15  Batch: 64  LR: 0.0005
+================================================================================
+
+[1/4] Collecting 40-frame adaptive windows...
+  Train: 10098  Test: 1783
+
+[2/4] Building 40-frame model + K-head decoder...
+  Trainable (decoder only): 48,163 / 1,392,508 (3.5%)
+  Baseline: single FDE=0.8386m  minFDE_5=0.7310m
+
+[3/4] Training K heads with WTA loss...
+  Epoch  0: loss=0.1354  single FDE=1.4389m  minFDE_5=0.6924m *
+  Epoch  2: loss=0.1133  single FDE=0.9500m  minFDE_5=0.6542m 
+  Epoch  4: loss=0.1100  single FDE=0.8574m  minFDE_5=0.7134m 
+  Epoch  6: loss=0.1278  single FDE=0.9369m  minFDE_5=0.6423m 
+  Epoch  8: loss=0.1257  single FDE=0.8919m  minFDE_5=0.6226m 
+  Epoch 10: loss=0.1233  single FDE=0.8880m  minFDE_5=0.6180m 
+  Epoch 12: loss=0.1219  single FDE=0.8825m  minFDE_5=0.6253m 
+  Epoch 14: loss=0.1213  single FDE=0.8768m  minFDE_5=0.6041m 
+
+[4/4] Final evaluation...
+
+================================================================================
+MULTI-HYPOTHESIS on 40-FRAME LOW ¡ª RESULTS (1783 test windows)
+================================================================================
+  Metric               Single-best      minK (oracle)    Change    
+  --------------------------------------------------------------
+  ADE                  0.4977           0.4070             +18.2%
+  FDE                  0.8737           0.5976             +31.6%
+  FDE P95              2.1398           1.5663          
+
+  Saved: E:\Desktop\TASKS AND WORK\Drone-trajectory-prediction\Drone-trajectory-prediction-portable\weights\low_multihead_K5_40frame.pth
+  Results saved: pic-results/multihead_40_K5.json
+================================================================================
