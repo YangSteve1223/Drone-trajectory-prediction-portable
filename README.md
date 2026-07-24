@@ -1,12 +1,12 @@
-# EMAM — 无人机轨迹预测系统 (Portable)
+# EMAM — Drone Trajectory Prediction System (Portable)
 
-基于 EMAM (Enhanced Mamba) 架构的无人机轨迹预测系统。核心特性：
+A drone trajectory prediction system built on the EMAM (Enhanced Mamba) architecture. Key features:
 
-- **双模型速度自适应软融合** — LOW (真实低速) + HIGH (仿真巡航)
-- **40 帧长历史扩展** — 长轨迹 FDE 从 2.32m 降到 0.87m，灾难性失败近乎归零
-- **LoRA 个性化** — 全局 LoRA（锦上添花）+ 逐无人机 LoRA（在线学习）
-- **多假设预测** — K=5 Winner-Takes-All，minFDE 显著优于单模型
-- **在线持续学习** — 逐无人机流式增量适配（LOW/HIGH 均已验证正收益）
+- **Speed-adaptive dual-model soft fusion** — LOW (real low-speed) + HIGH (simulated cruise)
+- **40-frame long-history extension** — long-trajectory FDE cut from 2.32m to 0.87m, catastrophic failures reduced to near zero
+- **LoRA personalization** — global LoRA (icing on the cake) + per-drone LoRA (online learning)
+- **Multi-hypothesis prediction** — K=5 Winner-Takes-All, minFDE clearly outperforms the single-hypothesis model
+- **Online continual learning** — per-drone streaming incremental adaptation (positive gains verified on both LOW and HIGH)
 
 ## 快速开始
 
@@ -135,7 +135,7 @@ K=5 独立预测头 + 置信度评分头，Winner-Takes-All 训练。推理取�
 ├── eval/                     # 评估脚本 (evaluate / eval_lora / eval_online_* ...)
 ├── train/                    # 训练流水线 + LoRA/多假设训练 + 40 帧扩展
 ├── viz/                      # 可视化 + 诊断 + rollout
-├── tests/                    # 回归测试 (deploy 门控 / SSM scan)
+├── tests/                    # 回归测试 (deploy 门控 / SSM scan) + 延迟基准
 ├── weights/                  # 预训练权重 (见下表)
 ├── pic-results/              # 评估图表 + README.md
 └── reviewtodelete/           # 弃置文件暂存 (gitignore, 待人工删除)
@@ -150,7 +150,7 @@ K=5 独立预测头 + 置信度评分头，Winner-Takes-All 训练。推理取�
 | `low_speed_6class.pth` | LOW 20 帧原始模型（短/中程） |
 | `low_speed_6class_40frame.pth` | LOW 40 帧扩展（长轨迹默认 base） |
 | `high_speed_4class.pth` | HIGH 20 帧模型 |
-| `dir_lora_40.pth` | **当前最佳全局 LoRA**（方向加权，+19.4% FDE） |
+| `dir_lora_40.pth` | **当前最佳全局 LoRA**（方向加权，跨飞行 +7.3% / window-level +19.4% FDE） |
 | `global_lora_40.pth` | 早期全局 LoRA（+14.9%，已被 dir_lora_40 取代） |
 | `gate_lora_40.pth` | 门控 LoRA（改善极端转弯灾难率 -1.76pp） |
 | `low_multihead_K5_40frame.pth` | LOW K=5 多假设头 |
