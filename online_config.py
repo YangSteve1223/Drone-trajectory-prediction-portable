@@ -3,11 +3,17 @@
 Shared configuration + base-model builder for per-drone ONLINE learning.
 
 Ties the online stack (adapter_manager / online_learner / streaming / predictor)
-to the validated 40-frame base and the correct upstream-only LoRA config — the
-same one proven by the offline experiments (NO delta_head, per-target ranks).
+to the validated 40-frame base and the correct upstream-only LoRA config (NO
+delta_head, per-target ranks).
 
-Deployment shape (validated by C6 stacking, +10.2% over per-drone alone):
-    40-frame base  ->  merge global LoRA (dir_lora_40)  ->  per-drone LoRA online
+Deployment shape:
+    40-frame base  ->  per-drone LoRA online
+
+Global LoRA (dir_lora_40) is DISABLED by default — it was trained on the full
+UAV-Flow window set (data leakage) and its cross-flight generalization is modest
+(+7.3% FDE). It remains available as opt-in via with_global=True / use_global=True
+for in-distribution use, but the recommended deployment path is base + per-drone
+online LoRA only.
 """
 
 import torch
@@ -37,6 +43,7 @@ ONLINE_HEAD_TARGETS = ['ua_pgd.anchor_to_pos.2']
 # dir_lora_40 is the current best global LoRA (+19.4% FDE, dir 13.8->12.1deg).
 GLOBAL_LORA_FILE = 'dir_lora_40.pth'
 BASE_40_FILE = 'low_speed_6class_40frame.pth'
+MULTIHEAD_40_FILE = 'low_multihead_K5_40frame.pth'  # K=5 WTA decoder
 
 # HIGH model (SimCruise, 1Hz, 4-class) — online learning uses base + per-drone
 # LoRA only, NO global layer (there is no HIGH global LoRA; 40-frame expansion
@@ -48,9 +55,11 @@ HIGH_DT = 1.0
 
 # ── Deployment gating ───────────────────────────────────────────────────────
 # Online per-drone learning only kicks in on long enough flights; short ones use
-# the plain base. The low-speed global LoRA is disabled above GLOBAL_MAX_SPEED
-# (it was trained on 0-3 m/s real DJI flight; faster motion is out of its domain).
+# the plain base. Below this threshold, no per-drone LoRA is created or trained.
 ONLINE_MIN_FRAMES = 60      # rolling-buffer frames before per-drone learning turns on
+
+# Global LoRA speed gate (only relevant when opt-in use_global=True).
+# dir_lora_40 was trained on 0-3 m/s real DJI flight; faster motion is out of its domain.
 GLOBAL_MAX_SPEED = 4.0      # m/s; above this the low-speed global LoRA is switched off
 
 
@@ -122,13 +131,40 @@ def merge_global_lora(model, global_file=GLOBAL_LORA_FILE, device='cuda'):
     return True
 
 
-def build_online_base(num_intent_classes=6, device='cuda', with_global=True):
-    """Build the deployment base: 40-frame model with the global LoRA merged in.
+def build_online_base(num_intent_classes=6, device='cuda', with_global=False):
+    """Build the deployment base: 40-frame model.
 
-    with_global=False gives the plain 40-frame base (for the frozen-baseline arm
-    of the online-learning comparison).
+    with_global=False (default): plain 40-frame base — recommended.
+    with_global=True (opt-in): merge global LoRA (dir_lora_40) for in-distribution use.
     """
     m = build_base_model(num_intent_classes=num_intent_classes, device=device)
     if with_global:
         merge_global_lora(m, device=device)
+    return m
+
+
+def build_multihead_base(num_intent_classes=6, device='cuda', K=5):
+    """Build 40-frame base with K-hypothesis WTA decoder.
+
+    Loads the single-head base weights first, then replaces the decoder with
+    MultiHeadNeuralDecoder and loads the pre-trained K=5 decoder weights.
+    Per-drone LoRA stacks cleanly on top (targets are in the encoder + shared
+    projection, not in the K delta heads).
+    """
+    from emam_model import TrajectoryPredictor
+    m = TrajectoryPredictor(
+        input_dim=6, history_len=HIST_LEN, pred_len=PRED_LEN,
+        d_model=128, d_state=16, d_conv=4, expand=2,
+        emam_n_layers=2, num_intent_classes=num_intent_classes,
+        use_trigger=True, trigger_mode='simple',
+    ).to(device).eval()
+    ckpt = torch.load(WEIGHT_DIR / BASE_40_FILE, map_location=device)
+    m.load_state_dict(ckpt['model_state_dict'])
+
+    # Replace decoder with multi-head variant
+    m.ua_pgd.replace_with_multi_head(K=K, noise_std=0.0)
+    mh_ckpt = torch.load(WEIGHT_DIR / MULTIHEAD_40_FILE, map_location=device)
+    m.ua_pgd.neural_decoder.load_state_dict(mh_ckpt['multi_decoder_state'])
+    # replace_with_multi_head creates the new decoder on CPU — move it to device
+    m.ua_pgd.neural_decoder = m.ua_pgd.neural_decoder.to(device)
     return m

@@ -44,7 +44,8 @@ The single-agent pipeline (see `README.md`) is the foundation. Key interfaces to
 - `emam_model/ua_pgd.py :: UncertaintyAwarePGD.forward(...)` and `.forward_multi_head(...)` /
   `.replace_with_multi_head(K)` — the decoder + K=5 multi-hypothesis head. Reused, lightly extended.
 - `lora.py`, `online_learner.py`, `adapter_manager.py`, `online_config.py` — the LoRA + online
-  learning stack. Reused for **per-swarm** adaptation (see §4).
+  learning stack. Per-drone online LoRA only (global LoRA disabled by default — data leakage
+  concern). Reused for **per-swarm** adaptation (see §4).
 
 **The single most important design principle:** the interaction module is inserted
 **between the encoder and the decoder**, operating on `enhanced_features (B,T,d_model)`.

@@ -66,14 +66,14 @@ predict(hist: torch.Tensor) -> dict
 
 ## 3. Entry point B — `DeployedLowPredictor` (long-trajectory + online learning)
 
-`deploy.py :: DeployedLowPredictor` — 40-frame base + global LoRA + per-drone online LoRA,
-behind three gates. Use for a persistently-flying low-speed drone that should personalize
-over time. **Single-stream (B=1).**
+`deploy.py :: DeployedLowPredictor` — 40-frame base + per-drone online LoRA, behind three
+gates. Use for a persistently-flying low-speed drone that should personalize over time.
+**Single-stream (B=1).**
 
 ### Constructor
 ```python
 DeployedLowPredictor(device: str | None = None,
-                     use_global: bool = True,          # enable shared global LoRA
+                     use_global: bool = False,         # enable shared global LoRA (opt-in)
                      global_max_speed: float = 4.0,     # speed gate (m/s): global off above this
                      online_min_frames: int = 60,       # length gate: personalize only after N frames
                      checkpoint_dir: str = 'weights/online_adapters',
@@ -104,8 +104,10 @@ predict(hist: torch.Tensor,
 
 ### Three gates (behavior)
 1. **Length gate** (`online_min_frames`): below threshold → plain 40-frame base, no LoRA.
-2. **Global toggle** (`use_global`): master on/off for the shared global LoRA.
-3. **Speed gate** (`global_max_speed`): global LoRA disabled above this speed (trained on 0–3 m/s).
+2. **Global toggle** (`use_global`): master on/off for the shared global LoRA. Disabled by default
+   (global LoRA was trained on the full window set = data leakage; cross-flight gain only +7.3%).
+3. **Speed gate** (`global_max_speed`): when global LoRA is opted in, it is disabled above this
+   speed (trained on 0–3 m/s).
 
 ### Session / state contract (important for integrators)
 - **Stateful.** The per-drone adapter is bound to one base for the whole drone session; do
@@ -152,6 +154,6 @@ predict(hist: torch.Tensor,
 
 - No built-in confidence-based rejection / fail-safe (see checklist — caller's responsibility).
 - HIGH model is 20-frame only (40-frame expansion was verified negative for 1 Hz cruise).
-- Global LoRA is validated in-dataset (cross-flight +7.3% FDE); for out-of-distribution
-  airspace, disable it (`use_global=False`) until re-validated.
+- Global LoRA is disabled by default (data leakage concern: trained on full window set;
+  cross-flight gain only +7.3% FDE). Opt in with `use_global=True` for in-distribution use.
 - Single-agent only — no interaction/collision modeling (see `ROADMAP.md`).

@@ -125,9 +125,9 @@ def main():
     trajs = trajs[:N_DRONES]
     print(f'  {len(trajs)} drones (long flights >= {MIN_LEN} frames)\n')
 
-    # Shared frozen base (40f + merged global LoRA) and the online base+manager
-    base_frozen = OC.build_online_base(device=DEVICE, with_global=True)
-    base_online = OC.build_online_base(device=DEVICE, with_global=True)
+    # Shared frozen base (40f, no global LoRA) and the online base+manager
+    base_frozen = OC.build_online_base(device=DEVICE, with_global=False)
+    base_online = OC.build_online_base(device=DEVICE, with_global=False)
     mgr = DroneAdapterManager(base_online, checkpoint_dir=str(CKPT_DIR))
     cfg = OnlineLearnerConfig(accumulation_steps=ACCUM, device=str(DEVICE),
                               conf_threshold=0.0)  # accept all obs in this sim
@@ -208,7 +208,7 @@ def main():
         ax3.set_xlabel('online updates seen'); ax3.set_ylabel('heldout FDE / frozen FDE')
         ax3.set_title('Does it get better the longer it flies?', fontsize=9, fontweight='bold')
         ax3.legend(fontsize=7)
-    fig.suptitle('Per-drone Online Learning — 40-frame base + global LoRA, streaming per-drone LoRA',
+    fig.suptitle('Per-drone Online Learning — 40-frame base, streaming per-drone LoRA (no global LoRA)',
                  fontsize=11, fontweight='bold')
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(OUT_DIR / 'online_learning.png', bbox_inches='tight'); plt.close(fig)

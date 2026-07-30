@@ -45,7 +45,7 @@ def _build(**kw):
 
 
 def test_length_gate_closed_below_threshold():
-    d = _build(use_global=True, online_min_frames=60)
+    d = _build(online_min_frames=60)  # default use_global=False
     out = d.predict(_make_hist(1.0), drone_id='d1', frames_seen=30)
     assert out['length_gate_open'] is False
     assert out['online_active'] is False
@@ -53,10 +53,19 @@ def test_length_gate_closed_below_threshold():
 
 
 def test_length_gate_open_above_threshold():
-    d = _build(use_global=True, online_min_frames=60)
+    d = _build(online_min_frames=60)  # default use_global=False
     out = d.predict(_make_hist(1.0), drone_id='d1', frames_seen=120)
     assert out['length_gate_open'] is True
     assert out['online_active'] is True
+
+
+def test_default_is_no_global():
+    """Default DeployedLowPredictor has use_global=False."""
+    d = _build()  # no use_global kwarg
+    out = d.predict(_make_hist(1.0), frames_seen=10)
+    assert out['base'] == 'plain'
+    assert out['global_active'] is False
+    assert d.base_global is None
 
 
 def test_speed_gate_disables_global_when_fast():
@@ -76,7 +85,7 @@ def test_global_toggle_off_never_uses_global():
 
 def test_online_learner_keeps_adapter_resident_and_learns():
     """After enough observations the resident per-drone LoRA must be non-zero."""
-    d = _build(use_global=True, online_min_frames=1)
+    d = _build(online_min_frames=1)  # default use_global=False
     drone = 'learner_drone'
     updated_any = False
     for t in range(12):

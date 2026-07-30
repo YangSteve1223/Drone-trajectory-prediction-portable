@@ -42,11 +42,18 @@ Dataset: UAV-Flow (real DJI, 5Hz) and SimCruise (sim cruise, 1Hz). K=5 multi-hyp
 
 | Experiment | Base | Result | Gain |
 |:--|:--:|:--:|:--:|
+| Per-drone online LoRA (40f) | FDE varies | varies | per-drone |
+| Multi-hyp K=5 (40f) | FDE 0.874 | 0.598 | +31.6% |
+| Gate-LoRA extreme turns | cata 10.65% | 8.89% | -1.76pp |
+
+Global LoRA results below are **opt-in only** (trained on full window set = data leakage;
+cross-flight gain only +7.3%). Not part of the default deployment path.
+
+| Experiment | Base | Result | Gain |
+|:--|:--:|:--:|:--:|
 | global_lora_40 (window-level) | FDE 0.826 | 0.703 | +14.9% |
 | dir_lora_40 (window-level) | FDE 0.826 | 0.665 | +19.4% |
 | dir_lora_40 cross-flight | FDE 0.758 | 0.702 | +7.3% |
-| Multi-hyp K=5 (40f) | FDE 0.874 | 0.598 | +31.6% |
 | LoRA stacking (global+local) | FDE 0.322 | 0.290 | +10.2% |
-| Gate-LoRA extreme turns | cata 10.65% | 8.89% | -1.76pp |
 
 > Negative: HIGH 20→40f hurts (1Hz cruise, no input bottleneck). Multi-frame physics seed rejected.
